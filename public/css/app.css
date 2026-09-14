@@ -10,7 +10,7 @@
   background: var(--surface);
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column;
-  position: sticky; top: 0; height: 100vh;
+  position: sticky; top: 0; height: 100vh; height: 100dvh;
 }
 .side-brand {
   height: var(--header-h); flex: none;
@@ -366,23 +366,91 @@
   .settings-nav { position: static; display: flex; gap: 6px; overflow-x: auto; }
   .settings-nav button { white-space: nowrap; width: auto; }
 }
+
+/* 手机端专属元素：桌面端默认隐藏，由 ≤760px 媒体查询开启 */
+.side-mask { display: none; }
+.bottom-nav { display: none; }
+.hamb { display: none; }
+
 @media (max-width: 760px) {
-  .app-shell { flex-direction: column; }
+  /* 侧栏改为左侧抽屉，底部用 Tab 导航 */
   .sidebar {
-    width: 100%; height: auto; position: static;
-    flex-direction: row; align-items: center;
-    border-right: none; border-bottom: 1px solid var(--border);
-    overflow-x: auto;
+    position: fixed; left: 0; top: 0; bottom: 0;
+    width: 80vw; max-width: 300px; height: 100vh; height: 100dvh;
+    z-index: 300; transform: translateX(-100%);
+    transition: transform .22s ease; box-shadow: var(--sh-lg);
+    flex-direction: column;
   }
-  .side-brand { border-bottom: none; border-right: 1px solid var(--border); }
-  .side-scroll { display: flex; gap: 4px; padding: 10px; overflow-x: auto; }
-  .side-group { margin-bottom: 0; display: flex; gap: 4px; }
-  .side-group-title { display: none; }
-  .side-item { white-space: nowrap; }
-  .side-item .cnt { display: none; }
-  .side-foot { display: none; }
-  .page { padding: 16px 14px 60px; }
-  .topbar { padding: 0 14px; }
+  .sidebar.open { transform: none; }
+  .side-mask {
+    display: block; position: fixed; inset: 0; background: rgba(15, 23, 42, .42);
+    z-index: 290; opacity: 0; visibility: hidden; transition: opacity .2s ease;
+  }
+  .side-mask.show { opacity: 1; visibility: visible; }
+  .app-shell { display: block; }
+  .main { padding-bottom: 66px; }
+
+  .page { padding: 16px 14px 24px; }
+  .topbar { padding: 10px 14px; flex-wrap: wrap; gap: 8px; }
+  .topbar h1 { font-size: 16px; }
+  .topbar-actions { width: 100%; margin-left: 0; margin-top: 4px; flex-wrap: wrap; }
+  .topbar-actions .btn { flex: 1 1 auto; min-width: 116px; }
+  .hamb {
+    flex: none; display: inline-grid; place-items: center;
+    width: 40px; height: 40px; margin-right: 4px;
+    border: none; background: none; border-radius: 10px; color: var(--text-2);
+  }
+  .hamb:hover { background: var(--bg-soft); }
+
   .grid.c2, .grid.c3, .grid.c4 { grid-template-columns: 1fr; }
-  .editor-summary { gap: 14px; }
+
+  /* 触摸目标 ≥44px */
+  .btn { min-height: 44px; }
+  .btn-sm { min-height: 40px; }
+  .chip { min-height: 40px; display: inline-flex; align-items: center; }
+  .seg button { min-height: 40px; }
+  .wstep { min-height: 40px; }
+
+  /* 报价编辑器：手机可触 */
+  .table-wrap { -webkit-overflow-scrolling: touch; }
+  .editor-table td input { height: 42px; }
+  .editor-summary { gap: 14px; justify-content: space-between; }
+
+  /* 底部 Tab 导航 */
+  .bottom-nav {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 200;
+    display: flex; background: var(--surface);
+    border-top: 1px solid var(--border);
+    box-shadow: 0 -4px 18px rgba(15, 23, 42, .07);
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+  .bottom-tab {
+    flex: 1; min-height: 52px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px; color: var(--text-3); font-size: 10.5px; font-weight: 560;
+    border: none; background: none;
+  }
+  .bottom-tab svg { width: 21px; height: 21px; }
+  .bottom-tab.active { color: var(--brand); }
+  .bottom-tab.active svg { filter: drop-shadow(0 2px 6px rgba(79, 70, 229, .3)); }
+
+  /* 报价行卡片化（依赖 editor.js 输出的 data-label） */
+  .editor-table > tbody > tr:first-child { display: none; }
+  .editor-table, .editor-table tbody, .editor-table tr.group-row,
+  .editor-table tr[data-id], .editor-table td { display: block; width: 100% !important; }
+  .editor-table tr.group-row { padding: 10px 12px; margin-bottom: 8px; border-radius: 10px; }
+  .editor-table tr[data-id] {
+    border: 1px solid var(--border); border-radius: 12px;
+    margin-bottom: 12px; padding: 4px 6px; background: #fff;
+  }
+  .editor-table tr[data-id] td {
+    border: none !important; padding: 7px 10px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .editor-table tr[data-id] td::before {
+    content: attr(data-label); flex: none; width: 60px;
+    font-size: 12px; font-weight: 600; color: var(--text-3);
+  }
+  .editor-table tr[data-id] td input { flex: 1; height: 42px; }
+  .editor-table tr[data-id] td:last-child { justify-content: flex-end; }
 }

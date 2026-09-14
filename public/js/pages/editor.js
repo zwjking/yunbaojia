@@ -211,13 +211,13 @@ function drawTable(el, filter = '') {
         <th style="width:12%">成本</th><th style="width:14%">小计</th><th style="width:6%"></th>
       </tr>
       ${shown.map((i) => `<tr data-id="${i.id}">
-        <td><input value="${esc(i.name)}" data-f="name" title="${esc(i.craft || '')}"></td>
-        <td><input value="${esc(i.unit)}" data-f="unit" style="text-align:center"></td>
-        <td><input class="r" type="number" step="0.01" value="${i.qty}" data-f="qty"></td>
-        <td><input class="r" type="number" step="0.01" value="${i.unit_price}" data-f="unit_price"></td>
-        <td><input class="r" type="number" step="0.01" value="${i.cost_price}" data-f="cost_price"></td>
-        <td style="text-align:right;padding-right:12px;font-family:var(--font-num);color:var(--text-2)">¥${fmt.money(i.unit_price * i.qty)}</td>
-        <td style="text-align:center"><button class="btn btn-ghost btn-sm" data-del="${i.id}">${icon('trash', 14)}</button></td>
+        <td data-label="项目"><input value="${esc(i.name)}" data-f="name" title="${esc(i.craft || '')}"></td>
+        <td data-label="单位"><input value="${esc(i.unit)}" data-f="unit" style="text-align:center"></td>
+        <td data-label="数量"><input class="r" type="number" step="0.01" value="${i.qty}" data-f="qty"></td>
+        <td data-label="单价"><input class="r" type="number" step="0.01" value="${i.unit_price}" data-f="unit_price"></td>
+        <td data-label="成本"><input class="r" type="number" step="0.01" value="${i.cost_price}" data-f="cost_price"></td>
+        <td data-label="小计" style="text-align:right;padding-right:12px;font-family:var(--font-num);color:var(--text-2)">¥${fmt.money(i.unit_price * i.qty)}</td>
+        <td data-label="操作" style="text-align:center"><button class="btn btn-ghost btn-sm" data-del="${i.id}">${icon('trash', 14)}</button></td>
       </tr>`).join('')}
     </tbody></table>`;
   }

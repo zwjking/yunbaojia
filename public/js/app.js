@@ -36,6 +36,9 @@ const MENU = [
 
 const ADMIN_MENU = { title: '平台', items: [{ key: 'admin', label: '平台管理', icon: 'building' }] };
 
+// 手机端底部 Tab 栏展示的核心入口（其余入口在「更多」抽屉里）
+const MOBILE_TABS = ['dashboard', 'estimate', 'quotes', 'library', 'ailab'];
+
 export function layout(active) {
   return `<div class="app-shell">
     <aside class="sidebar">
@@ -52,6 +55,7 @@ export function layout(active) {
     </aside>
     <div class="main">
       <div class="topbar">
+        <button class="hamb" id="hamb" type="button" aria-label="打开菜单"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
         <div>
           <h1 id="pageTitle">仪表盘</h1>
           <div class="sub" id="pageSub"></div>
@@ -60,6 +64,8 @@ export function layout(active) {
       </div>
       <div class="page" id="appMain"></div>
     </div>
+    <div class="side-mask" id="sideMask"></div>
+    <nav class="bottom-nav" id="bottomNav"></nav>
   </div>`;
 }
 
@@ -94,6 +100,36 @@ export function bindShell(root, me) {
   creditsEl.title = 'AI 功能按积分计费，成功才扣；套餐每月自动赠送';
   creditsEl.style.cursor = 'pointer';
   creditsEl.onclick = () => { location.hash = '#/app/billing'; };
+
+  // —— 手机端：底部 Tab 导航 + 侧栏抽屉开合 ——
+  const openDrawer = () => {
+    const sb = root.querySelector('.sidebar'); const mEl = root.querySelector('#sideMask');
+    if (sb) sb.classList.add('open');
+    if (mEl) mEl.classList.add('show');
+  };
+  const closeDrawer = () => {
+    const sb = root.querySelector('.sidebar'); const mEl = root.querySelector('#sideMask');
+    if (sb) sb.classList.remove('open');
+    if (mEl) mEl.classList.remove('show');
+  };
+  const tabMap = {};
+  menus.forEach((g) => g.items.forEach((it) => { tabMap[it.key] = it; }));
+  const navEl = root.querySelector('#bottomNav');
+  if (navEl) {
+    navEl.innerHTML = MOBILE_TABS.map((k) => {
+      const it = tabMap[k];
+      if (!it) return '';
+      return `<a class="bottom-tab ${active === k ? 'active' : ''}" href="#/app/${k}">${icon(it.icon, 20)}<span>${it.label}</span></a>`;
+    }).join('') + `<button class="bottom-tab" id="tabMore" type="button"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg><span>更多</span></button>`;
+    const moreBtn = navEl.querySelector('#tabMore');
+    if (moreBtn) moreBtn.onclick = openDrawer;
+    navEl.querySelectorAll('.bottom-tab[href]').forEach((t) => { t.addEventListener('click', closeDrawer); });
+  }
+  const hamb = root.querySelector('#hamb');
+  if (hamb) hamb.onclick = openDrawer;
+  const sideMask = root.querySelector('#sideMask');
+  if (sideMask) sideMask.onclick = closeDrawer;
+  root.querySelectorAll('.side-item').forEach((a) => { a.addEventListener('click', closeDrawer); });
 }
 
 function planName(p) {
@@ -103,5 +139,9 @@ function planName(p) {
 export function setActiveMenu(root, key) {
   root.querySelectorAll('.side-item').forEach((a) => {
     a.classList.toggle('active', a.getAttribute('href') === `#/app/${key}`);
+  });
+  root.querySelectorAll('.bottom-tab').forEach((t) => {
+    const href = t.getAttribute('href');
+    t.classList.toggle('active', !!href && href === `#/app/${key}`);
   });
 }
