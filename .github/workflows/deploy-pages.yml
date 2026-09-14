@@ -37,10 +37,8 @@ jobs:
       - name: 接口层自测（浏览器包跑通全部接口）
         run: node tools/test-demo.mjs
 
-      - name: 启用 Pages
+      - name: 配置 Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       - name: 打包站点产物
         uses: actions/upload-pages-artifact@v3
