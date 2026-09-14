@@ -3,6 +3,10 @@ name: Deploy to GitHub Pages
 # 把 public/ 作为静态站点发布到 GitHub Pages。
 # 发布前会先跑一遍 tools/build-demo.mjs：把 server/ 下的后端代码打包进浏览器，
 # 使注册登录、报价管理、15 项 AI 造价能力在纯静态环境下依然可用。
+#
+# 前置条件（一次性，手动）：仓库 Settings > Pages > Source 选择「GitHub Actions」。
+# 说明：无法由 workflow 自动创建 Pages 站点（默认 GITHUB_TOKEN 无该权限，会 403），
+# 必须先在 Settings 里启用 Pages；此后每次 push 到 main 均自动构建并发布。
 
 on:
   push:
@@ -24,12 +28,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 拉取代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 准备 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: 生成浏览器端数据层
         run: node tools/build-demo.mjs
