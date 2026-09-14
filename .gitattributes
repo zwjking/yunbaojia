@@ -1,0 +1,14 @@
+# 统一按 LF 存储，避免 Windows/macOS 协作时出现整文件差异
+* text=auto eol=lf
+
+# 明确标注二进制，防止被当作文本处理
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff2 binary
+
+# 生成代码在 GitHub 上折叠显示
+public/js/demo/bundle.js linguist-generated=true
+public/js/demo/boot.js linguist-generated=true

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>云报价 · 家装报价系统 — 3 分钟生成专业装修报价</title>
+  <meta name="description" content="云报价家装报价系统：AI 智能造价、工艺价格库、报价管理、客户分享，3 分钟生成专业装修报价，少改报价，多签单。" />
+  <meta name="keywords" content="家装报价,装修报价软件,装修报价单,智能造价,工艺价格库,装修报价系统" />
+  <meta name="theme-color" content="#4f46e5" />
+  <!-- 相对路径：本地 Node 服务与 GitHub Pages 子路径（/yunbaojia/）下均可正确加载 -->
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+  <link rel="stylesheet" href="css/base.css" />
+  <link rel="stylesheet" href="css/landing.css" />
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+  <div id="app">
+    <div class="boot-loading">
+      <div class="boot-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 9l9-6 9 6v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 21V12h6v9"/>
+        </svg>
+      </div>
+      <div class="boot-text">云报价 · 家装报价系统</div>
+    </div>
+  </div>
+  <div id="toast-host"></div>
+  <div id="modal-host"></div>
+  <!--
+    演示模式引导层：在静态托管（GitHub Pages 等）上把 /api/v1 请求接管到
+    浏览器端数据层。必须排在 main.js 之前。本地跑 server.js 时会自动让行，
+    仍走真实后端；也可用 ?demo=1 / ?demo=0 手动指定。
+  -->
+  <script type="module" src="js/demo/boot.js"></script>
+  <script type="module" src="js/main.js"></script>
+  <noscript>
+    <div style="padding:40px;text-align:center;font-family:sans-serif">
+      本系统需要启用 JavaScript 才能使用。
+    </div>
+  </noscript>
+</body>
+</html>
