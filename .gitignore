@@ -14,3 +14,26 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
+
+# === WB-20261110 云报价瘦身排除规则（君哥确认：公开仓 yunbaojia 沿用）===
+# 部署产物 / 宣传视频（894MB）/ 备份 / 生成结果
+_deploy/
+_backups/
+outputs/
+*.orig
+
+# 部署文档与云环境配置（含 CloudBase envId，公开仓不上传）
+DEPLOY*.md
+docs/*DEPLOY*.md
+cloudbaserc.json
+
+# 运行时与密钥
+*.key
+*.pem
+*.p12
+*.jks
+*.db
+*.sqlite*
+.env
+.env.*
+local.properties

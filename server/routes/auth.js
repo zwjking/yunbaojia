@@ -15,19 +15,19 @@ const PLANS = {
 
 /** 内存验证码（重启即失效，够用且安全） */
 const CODE_TTL = 5 * 60 * 1000;
-function setCode(key, code) {
-  db.sessions.removeWhere((s) => s.key === `code:${key}`);
-  db.sessions.insert({ id: uid(), key: `code:${key}`, code, expire_at: Date.now() + CODE_TTL });
+async function setCode(key, code) {
+  await db.sessions.removeWhere((s) => s.key === `code:${key}`);
+  await db.sessions.insert({ id: uid(), key: `code:${key}`, code, expire_at: Date.now() + CODE_TTL });
 }
-function getCode(key) {
-  const rec = db.sessions.findOne((s) => s.key === `code:${key}`);
+async function getCode(key) {
+  const rec = await db.sessions.findOne((s) => s.key === `code:${key}`);
   if (!rec) return null;
-  if (rec.expire_at < Date.now()) { db.sessions.remove(rec.id); return null; }
+  if (rec.expire_at < Date.now()) { await db.sessions.remove(rec.id); return null; }
   return rec.code;
 }
 
 /** 每月发放套餐赠送点数 */
-function grantMonthlyCredits(user) {
+async function grantMonthlyCredits(user) {
   const ym = new Date().toISOString().slice(0, 7);
   if (user.credits_month === ym) return user;
   const plan = PLANS[user.plan] || PLANS.free;
@@ -47,7 +47,7 @@ module.exports = function register(router) {
     const phone = String(body.phone || '').trim();
     if (!A.validPhone(phone)) return fail(res, '请输入正确的 11 位手机号。');
     const code = String(Math.floor(100000 + Math.random() * 900000));
-    setCode(phone, code);
+    await setCode(phone, code);
     ok(res, {
       sent: true,
       // 本地部署：无短信网关，直接回传验证码便于自测；生产环境应删除此字段
@@ -64,18 +64,18 @@ module.exports = function register(router) {
     if (!A.validPhone(phone)) return fail(res, '请输入正确的 11 位手机号。');
     if (!code) return fail(res, '请输入短信验证码。');
 
-    const real = getCode(phone);
+    const real = await getCode(phone);
     if (!real) return fail(res, '验证码已过期，请重新获取。');
     if (real !== code) return fail(res, '账号不存在或验证码错误。');
 
-    let user = db.users.findOne({ phone });
+    let user = await db.users.findOne({ phone });
     if (!user) {
-      user = createUser({ phone, name: `用户${phone.slice(-4)}`, plan: 'free' });
+      user = await createUser({ phone, name: `用户${phone.slice(-4)}`, plan: 'free' });
     } else if (user.status === 'disabled') {
       return fail(res, '账号已被停用，请联系管理员。', 403);
     }
-    db.sessions.removeWhere((s) => s.key === `code:${phone}`);
-    finishLogin(res, user);
+    await db.sessions.removeWhere((s) => s.key === `code:${phone}`);
+    await finishLogin(res, user);
   });
 
   /* ---------- 账号密码登录 ---------- */
@@ -84,12 +84,12 @@ module.exports = function register(router) {
     const pwd = String(body.password || '');
     if (!account || !pwd) return fail(res, '请输入账号和密码。');
 
-    const user = db.users.findOne({ phone: account }) || db.users.findOne({ email: account });
+    const user = await db.users.findOne({ phone: account }) || await db.users.findOne({ email: account });
     if (!user) return fail(res, '账号不存在或密码错误。', 401);
     if (!A.verifyPassword(pwd, user.password_hash)) return fail(res, '账号不存在或密码错误。', 401);
     if (user.status === 'disabled') return fail(res, '账号已被停用，请联系管理员。', 403);
 
-    finishLogin(res, user);
+    await finishLogin(res, user);
   });
 
   /* ---------- 注册 ---------- */
@@ -101,24 +101,24 @@ module.exports = function register(router) {
 
     if (!A.validPhone(phone)) return fail(res, '请输入正确的 11 位手机号。');
     if (pwd.length < 6) return fail(res, '密码至少 6 位。');
-    if (db.users.findOne({ phone })) return fail(res, '该手机号已注册，请直接登录。');
+    if (await db.users.findOne({ phone })) return fail(res, '该手机号已注册，请直接登录。');
 
     if (code) {
-      const real = getCode(phone);
+      const real = await getCode(phone);
       if (!real) return fail(res, '验证码已过期，请重新获取。');
       if (real !== code) return fail(res, '验证码错误。');
-      db.sessions.removeWhere((s) => s.key === `code:${phone}`);
+      await db.sessions.removeWhere((s) => s.key === `code:${phone}`);
     }
 
-    const user = createUser({ phone, password: pwd, name: name || `用户${phone.slice(-4)}`, email: body.email, plan: body.plan || 'free' });
-    finishLogin(res, user, 201);
+    const user = await createUser({ phone, password: pwd, name: name || `用户${phone.slice(-4)}`, email: body.email, plan: body.plan || 'free' });
+    await finishLogin(res, user, 201);
   });
 
   /* ---------- 刷新令牌 ---------- */
   api.post('/auth/refresh', async (req, res, body) => {
     const payload = A.verify(String(body.refresh_token || ''));
     if (!payload || payload.type !== 'refresh') return fail(res, '登录状态已失效，请重新登录。', 401);
-    const user = db.users.findOne({ id: payload.sub });
+    const user = await db.users.findOne({ id: payload.sub });
     if (!user || user.status === 'disabled') return fail(res, '登录状态已失效，请重新登录。', 401);
     ok(res, { ...A.issueTokens(user), user: A.publicUser(user) });
   });
@@ -128,10 +128,10 @@ module.exports = function register(router) {
 
   /* ---------- 当前用户 ---------- */
   api.get('/users/me', async (req, res) => {
-    let user = A.requireAuth(req, res);
+    let user = await A.requireAuth(req, res);
     if (!user) return;
-    user = grantMonthlyCredits(user);
-    const org = db.orgs.findOne({ id: user.org_id });
+    user = await grantMonthlyCredits(user);
+    const org = await db.orgs.findOne({ id: user.org_id });
     ok(res, {
       ...A.publicUser(user),
       org: org || null,
@@ -141,106 +141,106 @@ module.exports = function register(router) {
   });
 
   api.put('/users/me', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const patch = {};
     ['name', 'avatar', 'phone2', 'company', 'title'].forEach((k) => {
       if (body[k] !== undefined) patch[k] = body[k];
     });
-    const updated = db.users.update(user.id, patch);
+    const updated = await db.users.update(user.id, patch);
     ok(res, A.publicUser(updated));
   });
 
   api.put('/users/me/password', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!A.verifyPassword(String(body.old_password || ''), user.password_hash)) {
       return fail(res, '原密码不正确。');
     }
     if (String(body.new_password || '').length < 6) return fail(res, '新密码至少 6 位。');
-    db.users.update(user.id, { password_hash: A.hashPassword(body.new_password) });
+    await db.users.update(user.id, { password_hash: A.hashPassword(body.new_password) });
     ok(res, { ok: true, message: '密码已更新。' });
   });
 
   api.get('/users/plan-info', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, planInfo(user));
   });
 
   api.get('/users/me/permissions', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, permissionsOf(user));
   });
 
   /* ---------- 组织 ---------- */
   api.get('/org/profile', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, db.orgs.findOne({ id: user.org_id }) || {});
+    ok(res, await db.orgs.findOne({ id: user.org_id }) || {});
   });
 
   api.put('/org/profile', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!['owner', 'admin'].includes(user.role)) return fail(res, '仅管理员可修改组织信息。', 403);
     const patch = {};
     ['name', 'logo', 'phone', 'address', 'intro', 'brand_color'].forEach((k) => {
       if (body[k] !== undefined) patch[k] = body[k];
     });
-    ok(res, db.orgs.update(user.org_id, patch));
+    ok(res, await db.orgs.update(user.org_id, patch));
   });
 
   api.get('/org/settings', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const org = db.orgs.findOne({ id: user.org_id }) || {};
+    const org = await db.orgs.findOne({ id: user.org_id }) || {};
     ok(res, org.settings || defaultOrgSettings());
   });
 
   api.put('/org/settings', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!['owner', 'admin'].includes(user.role)) return fail(res, '仅管理员可修改设置。', 403);
-    const org = db.orgs.findOne({ id: user.org_id });
+    const org = await db.orgs.findOne({ id: user.org_id });
     const merged = { ...defaultOrgSettings(), ...(org.settings || {}), ...(body.settings || body) };
-    db.orgs.update(user.org_id, { settings: merged });
+    await db.orgs.update(user.org_id, { settings: merged });
     ok(res, merged);
   });
 
   /* ---------- 成员（团队） ---------- */
   api.get('/users', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const list = db.users.find({ org_id: user.org_id }).map(A.publicUser);
+    const list = (await db.users.find({ org_id: user.org_id })).map(A.publicUser);
     ok(res, list);
   });
 
   api.put('/users/:id/role', async (req, res, body, params) => {
-    const user = A.requireAdmin(req, res);
+    const user = await A.requireAdmin(req, res);
     if (!user) return;
-    const target = db.users.findOne({ id: params.id });
+    const target = await db.users.findOne({ id: params.id });
     if (!target || target.org_id !== user.org_id) return fail(res, '成员不存在。', 404);
     if (!['owner', 'admin', 'member'].includes(body.role)) return fail(res, '角色不合法。');
-    ok(res, A.publicUser(db.users.update(target.id, { role: body.role })));
+    ok(res, A.publicUser(await db.users.update(target.id, { role: body.role })));
   });
 
   api.post('/users/invitations', async (req, res, body) => {
-    const user = A.requireAdmin(req, res);
+    const user = await A.requireAdmin(req, res);
     if (!user) return;
     const phone = String(body.phone || '').trim();
     if (!A.validPhone(phone)) return fail(res, '请输入正确的 11 位手机号。');
-    ok(res, db.notifications.insert({
+    ok(res, await db.notifications.insert({
       id: uid(), org_id: user.org_id, type: 'invitation', phone,
       role: body.role || 'member', status: 'pending', invited_by: user.id,
     }));
   });
 
   api.get('/users/invitations', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, db.notifications.find({ org_id: user.org_id, type: 'invitation' }));
+    ok(res, await db.notifications.find({ org_id: user.org_id, type: 'invitation' }));
   });
 
   /* ---------- 公开配置 ---------- */
@@ -257,18 +257,19 @@ module.exports = function register(router) {
 
 /* ---------------- 内部函数 ---------------- */
 
-function createUser({ phone, password, name, email, plan }) {
-  const org = db.orgs.insert({
+async function createUser({ phone, password, name, email, plan }) {
+  const org = await db.orgs.insert({
     id: uid(),
     name: `${name || phone} 的团队`,
     plan: plan || 'free',
     created_at: now(),
   });
   // 为新组织初始化一份可编辑的工艺库副本
-  seedLibraryForOrg(org.id);
+  await seedLibraryForOrg(org.id);
 
   const ym = new Date().toISOString().slice(0, 7);
-  const user = db.users.insert({
+  const userCount = await db.users.count();
+  const user = await db.users.insert({
     id: uid(),
     phone,
     email: email || '',
@@ -283,17 +284,16 @@ function createUser({ phone, password, name, email, plan }) {
     export_used: 0,
     export_purchased: 0,
     // 仅当系统里一个用户都没有时，首个注册者自动成为平台管理员。
-    // 注意：必须是 === 0 —— 用 === 1 会让「已有 1 个用户」时注册的新账号也拿到管理员权限。
-    is_platform_admin: db.users.count() === 0,
+    is_platform_admin: userCount === 0,
     created_at: now(),
   });
   return user;
 }
 
-function finishLogin(res, user, status = 200) {
-  user = grantMonthlyCredits(user);
-  db.users.update(user.id, { last_login_at: now() });
-  const org = db.orgs.findOne({ id: user.org_id });
+async function finishLogin(res, user, status = 200) {
+  user = await grantMonthlyCredits(user);
+  await db.users.update(user.id, { last_login_at: now() });
+  const org = await db.orgs.findOne({ id: user.org_id });
   res.statusCode = status;
   ok(res, {
     ...A.issueTokens(user),

@@ -373,30 +373,77 @@ __define('@http', function () {
 /* ================= demo/db.browser.js → 替换 server/lib/db.js ================= */
 __define("server/lib/db.js", function (module, exports, require, __dirname, __filename) {
 /* ============================================================================
- * 浏览器端数据层（构建时以 server/lib/db.js 的身份注册）
+ * 浏览器端数据层（资料库 Database 持久化 + localStorage 兜底）
  *
  * 对外 API 与服务端 lib/db.js 完全一致（all/find/findOne/insert/insertMany/
- * update/remove/removeWhere/count/nextSeq），因此上层路由与 AI 引擎无需任何改动。
- * 区别只在存储介质：Node 写 data/*.json → 浏览器写 localStorage。
+ * update/remove/removeWhere/count/nextSeq），上层路由与 AI 引擎无需任何改动。
+ *
+ * 持久化策略：
+ *   - 有 window.__SMART_PAGE__.database（资料库发布态）→ 读写在资料库结构化数据表
+ *   - 不可用（本地 file:// / 普通静态托管）→ 退化为 localStorage，并内置演示种子
+ * 字段映射：每个集合的字段类型在此声明，写入时按类型包装成 PropertyValue。
  * ========================================================================== */
 
-const __DB_PREFIX = 'hq_demo_v1:';
-const __DB_SCHEMA = '1';
-const __PERSIST_MAX = 900 * 1024; // 单集合持久化上限，超出则裁剪历史日志
+/* 【坑】表 id 缺失时该集合会静默退化为 localStorage（不报错）→ 新增表必须同时补这里 */
+const DB_IDS = {"users":"AUkb8i7e6iepxWPy6MTJA1","orgs":"RrjZUyTfN8A3HnHhojRKkN","quotes":"3YixzVqRnu3JZUb9gtYqnY","quote_items":"UDOAqSMrnFiOmrvA66wUNc","customers":"vwr5xVlAXAhzyXil5x6Isn","templates":"0SjLcn85g9hbZXPihdSoDr","library":"oaqhJHRs5MYlVBeZsNJ5Bq","credits":"Fdm1HhENJgEh8SNV0fUADB","orders":"NZLYr3F3mxOo9UvpUcpefx"};
 
-function __storage() {
-  try {
-    localStorage.setItem('__hq_probe', '1');
-    localStorage.removeItem('__hq_probe');
-    return localStorage;
-  } catch (e) {
-    return null; // 隐私模式等场景：退化为纯内存，功能仍可用
-  }
+/* 各集合字段类型（与资料库表结构一一对应）
+ * 【坑】此处未声明的字段会在写库时被 docToProperties 静默丢弃 →
+ *       表现为「页面上改了、刷新就还原」，且完全没有报错。新增字段必须同步补这里。 */
+const FIELD_TYPES = {
+  users: { id:'text', phone:'phone_number', email:'text', password_hash:'text', name:'text', org_id:'text', plan:'select', role:'select', status:'select', credits:'number', credits_month:'text', export_used:'number', export_purchased:'number', is_platform_admin:'checkbox', permissions:'json', plan_expires_at:'text', last_login_at:'text', created_at:'text', updated_at:'text' },
+  orgs: { id:'text', name:'text', plan:'select', settings:'json', status:'select', created_at:'text', updated_at:'text' },
+  orders: { id:'text', org_id:'text', user_id:'text', kind:'select', order_no:'text', plan:'text', plan_name:'text', cycle:'select', pack_code:'text', pack_name:'text', call_count:'number', amount:'number', status:'select', paid_at:'text', pay_method:'text', refunded_at:'text', invoice_requested:'checkbox', invoice_status:'select', invoice_title:'text', invoice_tax_no:'text', created_at:'text', updated_at:'text' },
+  quotes: { id:'text', org_id:'text', user_id:'text', quote_number:'text', title:'text', customer_id:'text', customer_name:'text', customer_phone:'phone_number', community:'text', city:'text', province:'text', building_area:'number', layout:'text', tier:'select', house_type:'select', house_age:'number', floor:'number', building_type:'text', status:'select', total_amount:'number', cost_amount:'number', margin_rate:'number', item_count:'number', notes:'text', items:'json', created_at:'text', updated_at:'text' },
+  quote_items: { id:'text', org_id:'text', quote_id:'text', room:'text', name:'text', category:'text', quantity:'number', unit:'text', unit_price:'number', amount:'number', note:'text', created_at:'text', updated_at:'text' },
+  customers: { id:'text', org_id:'text', name:'text', phone:'phone_number', community:'text', building_area:'number', layout:'text', source:'text', status:'select', created_at:'text', updated_at:'text' },
+  templates: { id:'text', org_id:'text', user_id:'text', name:'text', layout:'text', building_area:'number', tier:'select', note:'text', spaces:'json', building_type:'text', house_type:'text', city:'text', source:'text', created_at:'text', updated_at:'text' },
+  library: { id:'text', org_id:'text', group_key:'text', group_name:'text', category:'text', subcategory:'text', name:'text', unit:'text', unit_price:'number', spec:'text', note:'text', source:'text', created_at:'text', updated_at:'text' },
+  credits: { id:'text', org_id:'text', user_id:'text', amount:'number', reason:'text', type:'select', created_at:'text', updated_at:'text' },
+};
+
+/* 入库时不同步的集合（体量大 / 只读基础库），始终走 localStorage */
+const LOCAL_ONLY = { library: true };
+
+const __DB_PREFIX = 'hq_web_v1:';
+const __DB_SCHEMA = '3';
+const __PERSIST_MAX = 900 * 1024;
+
+function uid() {
+  return (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)).toUpperCase();
+}
+function now() { return new Date().toISOString(); }
+
+/** 获取 database SDK（平台注入，可能尚未就绪） */
+function sdk() {
+  return (typeof window !== 'undefined' && window.__SMART_PAGE__ && window.__SMART_PAGE__.database) || null;
 }
 
+/**
+ * 等待资料库 SDK 注入就绪（平台在 page 加载后才异步注入
+ * window.__SMART_PAGE__.database）。若首屏即发生写操作，sdk() 可能暂为 null；
+ * 若不等待直接写库，记录会静默丢失（仅存内存）。这里轮询等待其就绪。
+ */
+async function waitSdk(timeoutMs) {
+  if (typeof window === 'undefined') return null;
+  const start = Date.now();
+  // 超时可通过 window.__HQ_SDK_TIMEOUT_MS 覆盖（自测/低延迟场景用）
+  const limit = timeoutMs || window.__HQ_SDK_TIMEOUT_MS || 10000;
+  let db = sdk();
+  while (!db && Date.now() - start < limit) {
+    await new Promise((r) => setTimeout(r, 150));
+    db = sdk();
+  }
+  return db;
+}
+
+/** localStorage 探测 */
+function __storage() {
+  try { localStorage.setItem('__hq_probe', '1'); localStorage.removeItem('__hq_probe'); return localStorage; }
+  catch (e) { return null; }
+}
 const __ls = __storage();
 const __memory = {};
-
 function __readRaw(key) {
   if (!__ls) return __memory[key] === undefined ? null : __memory[key];
   return __ls.getItem(key);
@@ -410,42 +457,246 @@ function __removeRaw(key) {
   __ls.removeItem(key);
 }
 
+/** 单个值 → PropertyValue（SDK 要求 { <类型>: 值 } 包装） */
+function toPV(type, val) {
+  if (val === undefined) return null;
+  if (type === 'json') {
+    if (val === null) return { text: 'null' };
+    try { return { text: typeof val === 'string' ? val : JSON.stringify(val) }; }
+    catch (e) { return { text: 'null' }; }
+  }
+  if (val === null || val === '') return null;
+  switch (type) {
+    case 'number': return { number: Number(val) || 0 };
+    case 'checkbox': return { checkbox: !!val };
+    case 'select': return { select: String(val) };
+    case 'phone_number': return { phone_number: String(val) };
+    case 'date': return { date: String(val) };
+    default: return { text: String(val) };
+  }
+}
+
+/** 业务对象 → properties（只保留表里声明过的字段）
+ *
+ * 【注意】未在 FIELD_TYPES 声明的字段会被丢弃 —— 这是「页面改了、刷新还原」的常见成因，
+ * 因此这里会留一条 drop 记录（同名字段只记一次，避免刷屏）。
+ */
+const __DROPPED_FIELD_SEEN = {};
+function docToProperties(coll, doc) {
+  const types = FIELD_TYPES[coll] || {};
+  const props = {};
+  Object.keys(doc).forEach(function (k) {
+    if (k === '__rid') return;
+    const t = types[k];
+    if (!t) {
+      const sig = coll + '.' + k;
+      if (!__DROPPED_FIELD_SEEN[sig]) {
+        __DROPPED_FIELD_SEEN[sig] = 1;
+        noteWriteFail('drop', coll, '字段未在 FIELD_TYPES 声明，写入时被丢弃: ' + k);
+      }
+      return;
+    }
+    const pv = toPV(t, doc[k]);
+    if (pv !== null) props[k] = pv;
+  });
+  return props;
+}
+
+/** 数据库记录（扁平）→ 业务对象（含 __rid 主键） */
+function recordToDoc(coll, rec) {
+  const types = FIELD_TYPES[coll] || {};
+  const doc = {};
+  Object.keys(rec).forEach(function (k) {
+    if (k === '_id') return;
+    const t = types[k];
+    let v = rec[k];
+    if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
+      // SDK 可能回传 { text: '...' } 包装；解包
+      const keys = Object.keys(v);
+      if (keys.length === 1 && ['text','number','select','multi_select','date','checkbox','url','email','phone_number','image'].indexOf(keys[0]) >= 0) {
+        v = v[keys[0]];
+      }
+    }
+    if (t === 'json') {
+      if (typeof v === 'string') { try { doc[k] = JSON.parse(v); } catch (e) { doc[k] = v; } }
+      else doc[k] = v === null || v === undefined ? null : v;
+    } else {
+      doc[k] = v === '' ? '' : v;
+    }
+  });
+  if (rec._id != null) doc.__rid = rec._id;
+  return doc;
+}
+
+/** 从 DB 加载全量数据（分页），保留记录主键 __rid */
+async function loadAll(db, dbId, coll) {
+  const all = [];
+  let cursor = undefined;
+  for (let guard = 0; guard < 100; guard++) {
+    const r = await db.query({ databaseId: dbId, pageSize: 200, startCursor: cursor });
+    all.push(...(r.results || []));
+    if (!r.hasMore || !r.nextCursor || r.nextCursor === cursor) break;
+    cursor = r.nextCursor;
+  }
+  return all.map(function (item) { return recordToDoc(coll, item); });
+}
+
+/* ============================================================================
+ * 写入失败记录（诊断用）
+ *
+ * 【为什么要这个】原实现里所有写库失败都是静默的：
+ *   - SDK 未就绪 → return
+ *   - 记录主键 __rid 缺失 → 整条跳过
+ *   - 底层抛错 → 只 console.error
+ * 于是「数据库根本没写进去」在界面上与「写成功了」完全一样，
+ * 只能靠去平台后台逐条比对记录时间戳才能发现。
+ * 现在任何一次写失败都会计数并留下最后一条原因，可通过 getWriteFailures() 读取。
+ * ========================================================================== */
+const __WRITE_FAILS = { insert: 0, update: 0, remove: 0, resolve: 0, last: null, log: [] };
+function noteWriteFail(kind, coll, detail) {
+  __WRITE_FAILS[kind] = (__WRITE_FAILS[kind] || 0) + 1;
+  const msg = kind + ' | ' + coll + ' | ' + (detail || 'unknown');
+  __WRITE_FAILS.last = msg;
+  if (__WRITE_FAILS.log.length < 40) __WRITE_FAILS.log.push(msg);
+  try { console.warn('[db-adapter] WRITE FAILED: ' + msg); } catch (e) { /* noop */ }
+}
+function getWriteFailures() { return { insert: __WRITE_FAILS.insert, update: __WRITE_FAILS.update, remove: __WRITE_FAILS.remove, resolve: __WRITE_FAILS.resolve, drop: __WRITE_FAILS.drop || 0, last: __WRITE_FAILS.last, log: __WRITE_FAILS.log.slice() }; }
+
+/** 从 SDK 返回的记录里取主键（平台用 _id；兼容 id / recordId / record_id） */
+function pickRid(r) {
+  if (!r) return null;
+  return r._id || r.id || r.recordId || r.record_id || null;
+}
+
+/** 单条写入 DB */
+async function dbInsert(db, dbId, coll, doc) {
+  if (!db) { noteWriteFail('insert', coll, 'sdk-not-ready'); return null; }
+  if (!dbId) { noteWriteFail('insert', coll, 'no-database-id'); return null; }
+  try {
+    const r = await db.addRecord({ databaseId: dbId, properties: docToProperties(coll, doc) });
+    const rid = pickRid(r);
+    if (!rid) noteWriteFail('insert', coll, 'response-has-no-record-id');
+    return rid;
+  } catch (e) { noteWriteFail('insert', coll, e && e.message); return null; }
+}
+
+/** 单条更新 DB（增量） */
+async function dbUpdate(db, dbId, coll, recordId, patch) {
+  if (!db) { noteWriteFail('update', coll, 'sdk-not-ready'); return false; }
+  if (!recordId) { noteWriteFail('update', coll, 'no-record-id'); return false; }
+  const props = docToProperties(coll, patch);
+  if (!Object.keys(props).length) { noteWriteFail('update', coll, 'empty-properties(字段未在 FIELD_TYPES 声明)'); return false; }
+  try {
+    await db.updateRecord({ databaseId: dbId, recordId: recordId, properties: props });
+    return true;
+  } catch (e) { noteWriteFail('update', coll, e && e.message); return false; }
+}
+
+/** 单条删除 DB */
+async function dbDelete(db, dbId, recordId) {
+  if (!db || !recordId) return false;
+  try { await db.deleteRecord({ databaseId: dbId, recordId: recordId }); return true; }
+  catch (e) { noteWriteFail('remove', recordId, e && e.message); return false; }
+}
+
+/**
+ * 记录主键缺失时，按业务 id 回平台反查 __rid（自愈）。
+ *
+ * 【为什么需要】__rid 只在两个时机拿到：loadFromDb 读库时、insert 成功时。
+ * 若某条记录是在「SDK 尚未注入」的首屏被插入的，或 addRecord 返回体没带主键，
+ * 它就会以 __rid=null 常驻内存 —— 此后所有 update 全部静默跳过（记录看起来永远改不动）。
+ * 这里在写之前补一次反查，把这类脏记录救回来。
+ */
+async function resolveRid(db, dbId, coll, doc) {
+  if (!db || !dbId || !doc || doc.id == null) return null;
+  try {
+    const r = await db.query({ databaseId: dbId, pageSize: 200 });
+    const hit = (r.results || []).find(function (rec) {
+      const flat = (rec && rec.properties) ? rec.properties : rec;
+      if (!flat) return false;
+      let v = flat.id;
+      if (v && typeof v === 'object') v = v.text !== undefined ? v.text : v.number;
+      return String(v) === String(doc.id);
+    });
+    const rid = pickRid(hit);
+    if (rid) doc.__rid = rid;
+    else noteWriteFail('resolve', coll, 'record-not-found-on-platform:id=' + doc.id);
+    return rid || null;
+  } catch (e) { noteWriteFail('resolve', coll, e && e.message); return null; }
+}
+
+/** 取记录主键：优先内存中的 __rid，缺失则回平台反查一次并回填 */
+async function ensureRid(db, dbId, coll, doc) {
+  if (doc.__rid) return doc.__rid;
+  return resolveRid(db, dbId, coll, doc);
+}
+
 class Collection {
   constructor(name, seedFn) {
     this.name = name;
+    this.dbId = LOCAL_ONLY[name] ? null : (DB_IDS[name] || null);
     this.key = __DB_PREFIX + name;
     this.dirty = false;
     this.timer = null;
+    this._seedFn = seedFn || null;
+    this._loaded = false;
+    this._writes = [];
+
+    // 先用 localStorage（同步可用），随后由 loadFromDb() 用数据库数据覆盖
     const raw = __readRaw(this.key);
     if (raw) {
-      try {
-        this.items = JSON.parse(raw);
-      } catch (e) {
-        console.warn(`[demo-db] ${name} 解析失败，已重建`, e.message);
-        this.items = seedFn ? seedFn() : [];
-        this.flush();
-      }
+      try { this.items = JSON.parse(raw); } catch (e) { this.items = seedFn ? seedFn() : []; }
     } else {
       this.items = seedFn ? seedFn() : [];
-      this.flush();
     }
   }
 
+  /** 从数据库加载（由 readyAll 统一触发；显式等待 SDK 注入就绪，避免首屏 sdk() 为 null 时静默跳过） */
+  async loadFromDb() {
+    if (this._loaded) return;
+    const db = await waitSdk();
+    if (!this.dbId || !db) {
+      if (this.dbId && !db) noteWriteFail('load', this.name, 'sdk-unavailable → 该集合本次会话走本地缓存');
+      this._loaded = true;
+      return;
+    }
+    try {
+      const data = await loadAll(db, this.dbId, this.name);
+      if (data && data.length > 0) {
+        this.items = data;
+        __writeRaw(this.key, JSON.stringify(this.items));
+      } else if (data && data.length === 0 && this._seedFn) {
+        // 数据库为空 → 用种子数据初始化并写入
+        const seedItems = this._seedFn();
+        this.items = seedItems;
+        __writeRaw(this.key, JSON.stringify(this.items));
+        for (const item of seedItems) {
+          const rid = await dbInsert(db, this.dbId, this.name, item);
+          if (rid) item.__rid = rid;
+          else await resolveRid(db, this.dbId, this.name, item);
+        }
+        __writeRaw(this.key, JSON.stringify(this.items));
+      }
+    } catch (e) {
+      console.error('[db-adapter] load failed', this.name, e && e.message);
+    } finally {
+      this._loaded = true;
+    }
+  }
+
+  _db() { return sdk(); }
+
   flush() {
     let payload = JSON.stringify(this.items);
-    // 超出上限时裁剪最旧记录（仅日志类集合会触发）
     if (payload.length > __PERSIST_MAX && this.items.length > 50) {
       this.items = this.items.slice(-50);
       payload = JSON.stringify(this.items);
     }
     const okWrite = __writeRaw(this.key, payload);
-    if (!okWrite) {
-      console.warn(`[demo-db] ${this.name} 写入失败（可能存储已满），本次仅保留在内存中`);
-    }
+    if (!okWrite) console.warn('[db-adapter] ' + this.name + ' 写入失败');
     this.dirty = false;
   }
 
-  /** 延迟合并写入：种子数据批量插入时只落盘一次 */
   save() {
     this.dirty = true;
     if (this.timer) return;
@@ -473,8 +724,24 @@ class Collection {
     doc.updated_at = now();
     this.items.push(doc);
     this.save();
+    if (this.dbId) {
+      const self = this;
+      this._track((async () => {
+        const db = await waitSdk();
+        if (!db) { noteWriteFail('insert', self.name, 'sdk-unavailable'); return; }
+        const rid = await dbInsert(db, self.dbId, self.name, doc);
+        if (rid) doc.__rid = rid;
+        else await resolveRid(db, self.dbId, self.name, doc);   // 返回体没带主键 → 反查回填，避免此后再也改不动
+      })());
+    }
     return doc;
   }
+
+  /** 记录后台写入，供 pending() 等待 */
+  _track(p) { this._writes.push(p); return p; }
+
+  /** 等待本集合全部待写入完成 */
+  pending() { return Promise.all(this._writes.splice(0)); }
 
   insertMany(docs) {
     docs.forEach((d) => {
@@ -483,49 +750,103 @@ class Collection {
     });
     this.items.push(...docs);
     this.save();
+    if (this.dbId) {
+      // 分批并发写入（每批 8 条），缩短大批量落库时间
+      const self = this;
+      const job = (async function () {
+        const db = await waitSdk();
+        if (!db) { noteWriteFail('insert', self.name, 'sdk-unavailable(batch)'); return; }
+        const BATCH = 8;
+        for (let i = 0; i < docs.length; i += BATCH) {
+          const slice = docs.slice(i, i + BATCH);
+          const rids = await Promise.all(slice.map((d) => dbInsert(db, self.dbId, self.name, d)));
+          for (let k = 0; k < slice.length; k++) {
+            if (rids[k]) slice[k].__rid = rids[k];
+            else await resolveRid(db, self.dbId, self.name, slice[k]);
+          }
+        }
+        __writeRaw(self.key, JSON.stringify(self.items));
+      })();
+      this._track(job);
+    }
     return docs;
   }
 
   update(id, patch) {
     const idx = this.items.findIndex((it) => it.id === id);
-    if (idx === -1) return null;
-    this.items[idx] = { ...this.items[idx], ...patch, updated_at: now() };
+    if (idx === -1) { noteWriteFail('update', this.name, 'local-record-not-found:id=' + id); return null; }
+    const prev = this.items[idx];
+    const merged = { ...prev, ...patch, updated_at: now() };
+    this.items[idx] = merged;
     this.save();
-    return this.items[idx];
+    if (this.dbId) {
+      const self = this;
+      this._track((async () => {
+        const db = await waitSdk();
+        if (!db) { noteWriteFail('update', self.name, 'sdk-unavailable'); return; }
+        // __rid 缺失（首屏 SDK 未就绪时写入 / insert 返回体无主键）→ 先回平台反查，
+        // 否则这次 update 会被静默丢弃（历史 bug：账号套餐改了但库里没变）
+        const rid = await ensureRid(db, self.dbId, self.name, merged);
+        if (!rid) return;
+        // 回填到集合内的当前记录：自愈只需一次，之后不再走反查
+        const cur = self.items.find((it) => it.id === id);
+        if (cur) cur.__rid = rid;
+        // updated_at 必须随 patch 一起写库；原实现只写增量字段，
+        // 结果线上所有记录的 updated_at 永远停在 created_at
+        await dbUpdate(db, self.dbId, self.name, rid, { ...patch, updated_at: merged.updated_at });
+      })());
+    }
+    return merged;
   }
 
   remove(id) {
     const idx = this.items.findIndex((it) => it.id === id);
     if (idx === -1) return false;
+    const removed = this.items[idx];
     this.items.splice(idx, 1);
     this.save();
+    if (this.dbId) {
+      const self = this;
+      this._track((async () => {
+        const db = await waitSdk();
+        if (!db) { noteWriteFail('remove', self.name, 'sdk-unavailable'); return; }
+        const rid = await ensureRid(db, self.dbId, self.name, removed);
+        if (!rid) return;
+        await dbDelete(db, self.dbId, rid);
+      })());
+    }
     return true;
   }
 
   removeWhere(pred) {
     const before = this.items.length;
+    const toRemove = this.items.filter(pred);
     this.items = this.items.filter((it) => !pred(it));
     if (this.items.length !== before) this.save();
+    if (this.dbId) {
+      const self = this;
+      toRemove.forEach((it) => this._track((async () => {
+        const db = await waitSdk();
+        if (!db) { noteWriteFail('remove', self.name, 'sdk-unavailable(where)'); return; }
+        const rid = await ensureRid(db, self.dbId, self.name, it);
+        if (!rid) return;
+        await dbDelete(db, self.dbId, rid);
+      })()));
+    }
     return before - this.items.length;
   }
 
   count(pred) { return pred ? this.find(pred).length : this.items.length; }
 
   nextSeq(key, start = 1) {
-    const meta = db.meta.findOne({ id: 'seq' }) || db.meta.insert({ id: 'seq', data: {} });
+    const meta = this.findOne({ id: 'seq' }) || this.insert({ id: 'seq', data: {} });
     const cur = (meta.data && meta.data[key]) || start - 1;
     const next = cur + 1;
     meta.data[key] = next;
-    db.meta.update('seq', { data: meta.data });
+    this.update('seq', { data: meta.data });
     return next;
   }
 }
-
-function uid() {
-  return (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)).toUpperCase();
-}
-
-function now() { return new Date().toISOString(); }
 
 const db = {
   users: new Collection('users'),
@@ -543,15 +864,22 @@ const db = {
   notifications: new Collection('notifications'),
 };
 
-/** 页面关闭前强制落盘，避免防抖窗口内数据丢失 */
+/** 等待所有集合从数据库加载完成（供 bootstrap 使用） */
+function readyAll() {
+  return Promise.all(Object.values(db).map((c) => c.loadFromDb()));
+}
+
+/** 等待所有后台写入落库完成 */
+function pendingAll() {
+  return Promise.all(Object.values(db).map((c) => c.pending()));
+}
+
 function flushAll() {
   Object.values(db).forEach((c) => { if (c.timer) { clearTimeout(c.timer); c.timer = null; } if (c.dirty) c.flush(); });
 }
 
-/** 清空全部演示数据（下次访问重新播种） */
 function resetAll() {
-  Object.keys(db).forEach((k) => __removeRaw(__DB_PREFIX + k));
-  __removeRaw(__DB_PREFIX + 'schema');
+  Object.keys(db).forEach((k) => { db[k].items = []; db[k].dirty = false; });
 }
 
 if (typeof addEventListener === 'function') {
@@ -559,10 +887,9 @@ if (typeof addEventListener === 'function') {
   addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll(); });
 }
 
-module.exports = { db, uid, now, DATA_DIR: 'localStorage', flushAll, resetAll, SCHEMA: __DB_SCHEMA, PREFIX: __DB_PREFIX };
+module.exports = { db, uid, now, DATA_DIR: 'database', flushAll, resetAll, readyAll, pendingAll, SCHEMA: __DB_SCHEMA, PREFIX: __DB_PREFIX, getWriteFailures, resolveRid, DB_IDS };
 });
 
-/* ================= server/lib/http.js ================= */
 __define("server/lib/http.js", function (module, exports, require, __dirname, __filename) {
 /**
  * 零依赖 HTTP 工具：路由表、请求体解析、JSON 响应、静态文件
@@ -3460,6 +3787,7 @@ const { ok, fail } = require('../lib/http');
 const PLANS = [
   {
     key: 'free', name: '免费版', tag: '体验入门', price: '¥0', cycle: '永久免费',
+    credits: 30,
     monthly: 0, yearly: 0,
     note: '随便新建、编辑、在线预览报价；出成品（导出 / 分享）时再按次购买。',
     cta: '免费开始', borderColor: '#94a3b8', glowColor: 'rgba(148,163,184,0.3)',
@@ -3468,6 +3796,7 @@ const PLANS = [
   },
   {
     key: 'personal', name: '普通版（按次）', tag: '按需出单', price: '¥9.9', cycle: '/ 1 次出单',
+    credits: 0,
     monthly: 0, yearly: 0,
     note: '9.9 元买 1 次，1 次 = 出一份报价（导出/出单）；同一份解锁后反复导出不重复扣次。',
     cta: '购买出单次数', borderColor: '#1565f5', glowColor: 'rgba(21,101,245,0.22)',
@@ -3476,6 +3805,7 @@ const PLANS = [
   },
   {
     key: 'plus', name: 'Plus 版', tag: '推荐 · 不限次', price: '¥38', cycle: '/ 月',
+    credits: 1000,
     monthly: 38, yearlyMonthly: 32, yearlyTotal: 388,
     note: '包月不限次导出，AI 全程协助、漏项提醒、价格风险预警，高频出单更划算。',
     cta: '开通 Plus 版', highlight: true, borderColor: '#7c3aed', glowColor: 'rgba(124,58,237,0.28)',
@@ -3484,6 +3814,7 @@ const PLANS = [
   },
   {
     key: 'enterprise', name: '企业版', tag: '团队使用', price: '定制', cycle: '按需报价',
+    credits: 5000,
     monthly: 0, yearly: 0,
     note: '席位 / 价格库 / 审批流按团队规模定制，价格一对一沟通。',
     cta: '联系开通', borderColor: '#0891b2', glowColor: 'rgba(8,145,178,0.22)',
@@ -3535,17 +3866,25 @@ module.exports = function register(api) {
     ok(res, order, 201);
   });
 
+  /* 结算：写用户套餐 + 有效期 + 赠送积分，并同步团队套餐。
+   * 【坑】原实现取 PLANS[].monthly_credits_bonus —— 该字段从来不存在，
+   *       NaN || 0 得 0，于是用户走一次在线开通积分会被清零。 */
   const settleSubscription = (order) => {
     const months = order.cycle === 'yearly' ? 12 : 1;
     const expires = new Date(Date.now() + months * 30 * 86400000).toISOString();
-    db.users.update(order.user_id, {
+    const curUser = db.users.findOne({ id: order.user_id });
+    if (!curUser) return false;
+    const cur = curUser.credits || 0;
+    const grant = (PLANS.find((p) => p.key === order.plan) || {}).credits || 0;
+    const okUser = db.users.update(order.user_id, {
       plan: order.plan,
       plan_expires_at: expires,
-      credits: (db.users.findOne({ id: order.user_id }).credits || 0) +
-        (PLANS.find((p) => p.key === order.plan) || {}).monthly_credits_bonus || 0,
+      credits: cur + grant,
+      credits_month: new Date().toISOString().slice(0, 7),
     });
     const org = db.orgs.findOne({ id: order.org_id });
-    if (org) db.orgs.update(org.id, { plan: order.plan });
+    const okOrg = org ? db.orgs.update(org.id, { plan: order.plan }) : true;
+    return !!okUser && !!okOrg;
   };
 
   api.post('/subscriptions/orders/:id/pay', async (req, res, body, params) => {
@@ -3807,8 +4146,14 @@ module.exports = function register(api) {
     if (!admin) return;
     const org = db.orgs.findOne({ id: params.id });
     if (!org) return fail(res, '组织不存在。', 404);
-    db.orgs.update(org.id, { plan: body.plan });
-    db.users.find({ org_id: org.id }).forEach((u) => db.users.update(u.id, { plan: body.plan }));
+    /* 团队套餐与成员账号必须一起改到位；失败即报错，不许静默（见 server/routes/admin.js 同段注释） */
+    const okOrg = db.orgs.update(org.id, { plan: body.plan });
+    if (!okOrg) return fail(res, '团队套餐更新失败，请重试。', 500);
+    const failed = [];
+    db.users.find({ org_id: org.id }).forEach((u) => { if (!db.users.update(u.id, { plan: body.plan })) failed.push(u.name || u.phone || u.id); });
+    if (failed.length) {
+      return fail(res, '团队套餐已更新，但 ' + failed.length + ' 个成员账号同步失败（' + failed.join('、') + '），请重试。', 500);
+    }
     ok(res, db.orgs.findOne({ id: org.id }));
   });
 
@@ -4180,7 +4525,7 @@ __define("demo/entry.js", function (module, exports, require, __dirname, __filen
  * 因此前端拿到的响应结构与真实后端逐字段一致。
  * ========================================================================== */
 
-const { db, uid, now, flushAll, resetAll } = require('server/lib/db.js');
+const { db, uid, now, flushAll, resetAll, readyAll, pendingAll } = require('server/lib/db.js');
 const { Router, ok, json } = require('server/lib/http.js');
 const A = require('server/lib/auth.js');
 const { initSystemLibrary, seedLibraryForOrg, seedDemoQuotes } = require('server/lib/seed.js');
@@ -4214,8 +4559,13 @@ api.get('/health', async (req, res) => {
 
 /* ---------------- 首次访问播种（对照 server.js 的 bootstrap） ---------------- */
 let booted = false;
+let __bootPromise = null;
 
 function bootstrap() {
+  if (__bootPromise) return __bootPromise;
+  __bootPromise = (async function () {
+    try { await readyAll(); } catch (e) { console.warn("[bootstrap] readyAll failed", e && e.message); }
+
   if (booted) return;
   booted = true;
   initSystemLibrary();
@@ -4243,11 +4593,14 @@ function bootstrap() {
     console.log(`[demo] 演示账号已就绪：13800000000 / 123456（含 ${n} 张示例报价）`);
   }
   flushAll();
+    try { await pendingAll(); } catch (e) { console.warn("[bootstrap] pendingAll failed", e && e.message); }
+  })();
+  return __bootPromise;
 }
 
 /* ---------------- 请求分发 ---------------- */
 async function handle(method, apiPath, body, headers) {
-  bootstrap();
+  await bootstrap();
 
   const m0 = String(method || 'GET').toUpperCase();
   const raw = String(apiPath || '/');
@@ -4305,6 +4658,11 @@ function stats() {
     templates: db.templates.count(),
     ai_logs: db.ai_logs.count(),
   };
+}
+
+/* 页面加载即初始化数据（含写入资料库持久层），不必等首个接口请求 */
+if (typeof setTimeout === "function") {
+  setTimeout(function () { try { bootstrap(); } catch (e) { console.warn("[boot] init failed", e && e.message); } }, 0);
 }
 
 module.exports = { handle, stats, flushAll, resetAll };

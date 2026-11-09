@@ -50,7 +50,7 @@ module.exports = function register(api) {
   });
 
   api.get('/ai/quota-status', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const plan = { free: 30, personal: 0, plus: 1000, enterprise: 5000 }[user.plan] || 30;
     ok(res, {
@@ -58,7 +58,7 @@ module.exports = function register(api) {
       credits: user.credits || 0,
       monthly_credits: plan,
       unlimited: !!user.platform_admin_unlimited,
-      usage_this_month: db.ai_logs.find((l) => l.user_id === user.id && l.month === curMonth()).length,
+      usage_this_month: (await db.ai_logs.find((l) => l.user_id === user.id && l.month === curMonth())).length,
       cost_list: AI.FEATURE_COSTS,
     });
   });
@@ -69,7 +69,7 @@ module.exports = function register(api) {
 
   /* ---------------- 统一调用入口（动态路由，静态路径由 Router 优先匹配） ---------------- */
   const runFeature = async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const feature = params.feature;
     if (!AI.FEATURES[feature]) return fail(res, `未知的 AI 功能：${feature}`, 404);
@@ -87,25 +87,25 @@ module.exports = function register(api) {
 
       const elapsed = Date.now() - started;
       // 日志记录真实消耗额（便于用量看板统计），管理员免扣余额
-      db.ai_logs.insert({
+      await db.ai_logs.insert({
         id: uid(), org_id: user.org_id, user_id: user.id,
         feature, feature_name: FEATURE_NAMES[feature] || feature,
         cost, billed: unlimited ? 0 : cost, status: 'success',
         engine: result._engine, elapsed_ms: elapsed,
         month: curMonth(), created_at: now(),
       });
-      if (!unlimited) db.users.update(user.id, { credits: (user.credits || 0) - cost });
-      db.ai_logs.flush();
+      if (!unlimited) await db.users.update(user.id, { credits: (user.credits || 0) - cost });
+      await db.ai_logs.flush();
 
       ok(res, { ...result, cost: unlimited ? 0 : cost, list_cost: cost, unlimited, elapsed_ms: elapsed });
     } catch (e) {
-      db.ai_logs.insert({
+      await db.ai_logs.insert({
         id: uid(), org_id: user.org_id, user_id: user.id,
         feature, feature_name: FEATURE_NAMES[feature] || feature,
         cost: 0, status: 'failed', error: e.message,
         month: curMonth(), created_at: now(),
       });
-      db.ai_logs.flush();
+      await db.ai_logs.flush();
       fail(res, e.message || 'AI 调用失败，请稍后重试。', 500, 'AI_FAILED');
     }
   };
@@ -113,8 +113,9 @@ module.exports = function register(api) {
   api.post('/ai/:feature', runFeature);
 
   /* ---------------- 兼容原站独立路径 ---------------- */
+  /* ---------------- 兼容原站独立路径 ---------------- */
   const alias = (path, feature) => {
-    api.post(path, (req, res, body) => runFeature(req, res, body, { feature }));
+    api.post(path, async (req, res, body) => await runFeature(req, res, body, { feature }));
   };
 
   alias('/ai/smart-estimate', 'smart-estimate');
@@ -137,16 +138,16 @@ module.exports = function register(api) {
 
   /* ---------------- 估算结果 → 正式报价 ---------------- */
   api.post('/ai/estimate-to-quote', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
 
     const payload = body.params || body;
-    const est = AI.estimate({ ...payload, pkg: AI.PACKAGES.find((p) => p.code === payload.package_code) });
+    const est = await AI.estimate({ ...payload, pkg: AI.PACKAGES.find((p) => p.code === payload.package_code) });
 
     const qid = uid();
-    const quote = db.quotes.insert({
+    const quote = await db.quotes.insert({
       id: qid, org_id: user.org_id, user_id: user.id,
-      quote_number: genQuoteNo(user.org_id),
+      quote_number: await genQuoteNo(user.org_id),
       title: `${payload.city || ''}${payload.building_area || ''}㎡ ${payload.layout || ''} ${payload.tier || ''}报价草稿`,
       city: payload.city || '', province: payload.province || '',
       building_area: Number(payload.building_area) || 0,
@@ -165,35 +166,39 @@ module.exports = function register(api) {
       created_at: now(), updated_at: now(),
     });
 
-    db.quote_items.insertMany(
+    await db.quote_items.insertMany(
       est.items.map((it) => ({
         ...it, id: uid(), quote_id: qid, org_id: user.org_id,
         amount: Math.round(it.unit_price * it.qty * 100) / 100,
         created_at: now(),
       }))
     );
-    db.quote_items.flush();
+    await db.quote_items.flush();
 
     ok(res, { quote, items_count: est.items.length, total: est.total, assumptions: est.assumptions });
   });
 
   /* ---------------- 用量看板（管理视角） ---------------- */
   api.get('/ai/usage-summary', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!['owner', 'admin'].includes(user.role) && !user.is_platform_admin) {
       return fail(res, '仅管理员可查看用量看板。', 403);
     }
-    const logs = db.ai_logs.find((l) => l.org_id === user.org_id);
+    const logs = await db.ai_logs.find((l) => l.org_id === user.org_id);
     const byFeature = {};
     const byUser = {};
     const byDay = {};
     let tokens = 0;
+    const byUserEntries = await Promise.all(logs.map(async (l) => {
+      const u = await db.users.findOne({ id: l.user_id });
+      return { [l.user_id]: { user_id: l.user_id, name: u?.name || l.user_id, calls: 0, credits: 0 } };
+    }));
+    byUserEntries.forEach((entry) => Object.assign(byUser, entry));
     logs.forEach((l) => {
       byFeature[l.feature_name] = byFeature[l.feature_name] || { name: l.feature_name, calls: 0, credits: 0 };
       byFeature[l.feature_name].calls += 1;
       byFeature[l.feature_name].credits += l.cost || 0;
-      byUser[l.user_id] = byUser[l.user_id] || { user_id: l.user_id, name: (db.users.findOne({ id: l.user_id }) || {}).name || l.user_id, calls: 0, credits: 0 };
       byUser[l.user_id].calls += 1;
       byUser[l.user_id].credits += l.cost || 0;
       const d = (l.created_at || '').slice(0, 10);

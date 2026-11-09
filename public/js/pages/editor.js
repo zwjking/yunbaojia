@@ -3,7 +3,8 @@
  */
 import {
   api, icon, esc, fmt, toast, emptyState, loadingRow, confirmBox,
-  exportCSV, printQuote, modal,
+  exportCSV, exportExcel, printQuote, modal, createClientLink, buildClientQuoteText,
+  downloadQuoteImage,
 } from '../core.js';
 import { STATUS_MAP } from './dashboard.js';
 
@@ -59,11 +60,11 @@ function draw(el, ctx) {
   ctx.setTitle(quote.title || '报价编辑', `${quote.quote_number} · ${(STATUS_MAP[quote.status] || [quote.status])[0]}`);
   ctx.setActions(`
     <button class="btn btn-secondary" id="edBack">${icon('arrowLeft', 15)} 返回列表</button>
+    <button class="btn btn-secondary" id="edShare">${icon('share', 15)} 分享给客户</button>
+    <button class="btn btn-secondary" id="edExcel">${icon('file', 15)} 导出 Excel</button>
     <button class="btn btn-secondary" id="edPrint">${icon('download', 15)} 打印 / PDF</button>
-    <button class="btn btn-secondary" id="edShare">${icon('share', 15)} 客户链接</button>
     <button class="btn btn-primary" id="edSave">${icon('save', 15)} 保存</button>
   `);
-
   const c = calc();
   el.innerHTML = `
     <div class="grid c32">
@@ -310,29 +311,13 @@ function bindEditor(el, ctx) {
   });
 
   ctx.bind('#edShare', 'onclick', async () => {
-    try {
-      const r = await api.post(`/quotes/${quote.id}/share`, {});
-      const url = `${location.origin}${location.pathname}#/q/${r.token}`;
-      modal({
-        title: '客户报价链接',
-        width: 560,
-        body: `<p class="t-sm dim" style="margin-bottom:12px">把这个链接发给客户，客户用手机就能打开查看报价明细。</p>
-          <div class="field"><label class="field-label">分享链接</label>
-            <input class="input" id="shareUrl" value="${url}" readonly></div>
-          <div class="row gap8 mt12">
-            <button class="btn btn-secondary" id="copyUrl">${icon('copy', 15)} 复制链接</button>
-            <a class="btn btn-secondary" href="${url}" target="_blank">${icon('eye', 15)} 预览</a>
-          </div>`,
-        footer: `<button class="btn btn-primary" data-close>完成</button>`,
-        onMount(m) {
-          m.querySelector('#copyUrl').onclick = () => {
-            const inp = m.querySelector('#shareUrl');
-            inp.select();
-            navigator.clipboard.writeText(inp.value).then(() => toast('链接已复制', 'success')).catch(() => toast('请手动复制', 'error'));
-          };
-        },
-      });
-    } catch (e) { toast(e.message, 'error'); }
+    const org = await api.get('/org/profile').catch(() => ({}));
+    clientLinkModal(quote, items, org);
+  });
+
+  ctx.bind('#edExcel', 'onclick', async () => {
+    const org = await api.get('/org/profile').catch(() => ({}));
+    await exportExcel(quote, items, org);
   });
 
   el.querySelector('#edAddRow').onclick = () => {
@@ -362,6 +347,161 @@ function bindEditor(el, ctx) {
         draw(el, ctx);
       } catch (e) { toast(e.message, 'error'); }
     };
+  });
+}
+
+function safeName(s) {
+  return String(s || '').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60);
+}
+
+/**
+ * 生成客户链接：
+ * 把整份报价做成一份自包含的报价网页，上传到云端换取公网链接 —— 客户手机或电脑
+ * 打开就是一个完整报价页，不需要登录、不需要安装任何东西。上传失败时自动退化为长图。
+ * 链接是报价内容的快照，改动后点「重新生成」即可同步。
+ */
+function clientLinkModal(q, list, org) {
+  const cacheKey = `hq_client_link_${q.id}`;
+  const readCache = () => {
+    try { return JSON.parse(localStorage.getItem(cacheKey) || 'null'); } catch (e) { return null; }
+  };
+  const writeCache = (v) => {
+    try { localStorage.setItem(cacheKey, JSON.stringify(v)); } catch (e) { /* 忽略 */ }
+  };
+
+  modal({
+    title: '生成客户链接',
+    width: 600,
+    body: `<div id="clBody">
+      <div style="text-align:center;padding:40px 0">
+        <div class="spinner dark" style="width:22px;height:22px;margin:0 auto"></div>
+        <div class="t-sm muted mt12">正在生成客户报价页…</div>
+      </div>
+    </div>`,
+    footer: `<button class="btn btn-secondary" data-close>关闭</button>`,
+    onMount(m, close) {
+      const box = m.querySelector('#clBody');
+
+      const okHtml = (res, at) => {
+        const url = res.url || '';
+        const isImg = res.kind === 'image';
+        const isLocal = res.kind === 'local';
+        const isWeb = res.kind === 'html';
+        const badge = (bg, fg, txt) => `<span style="display:inline-block;background:${bg};color:${fg};border-radius:6px;padding:3px 9px;font-size:11.5px;font-weight:600">${txt}</span>`;
+        const headTag = isLocal
+          ? badge('#fef3c7', '#b45309', '暂未拿到链接') + '<span class="t-xs muted">可直接保存长图发给客户</span>'
+          : isWeb
+            ? badge('#dcfce7', '#15803d', '客户报价页已生成') + '<span class="t-xs muted">网页版，客户手机打开即看，无需登录</span>'
+            : badge('#dcfce7', '#15803d', '客户链接已生成') + '<span class="t-xs muted">图片版，客户手机打开即可查看</span>';
+        return `
+        <div style="display:flex;align-items:center;gap:9px;margin-bottom:12px;flex-wrap:wrap">${headTag}</div>
+        ${isLocal ? `<div style="padding:11px 13px;background:#fffbeb;border:1px solid #fde68a;border-radius:9px;color:#92400e;font-size:12.5px;line-height:1.7;margin-bottom:12px">${esc(res.reason || '')}</div>` : ''}
+        ${url ? `<input class="input" id="clUrl" readonly value="${esc(url)}"
+          style="width:100%;font-size:12.5px;font-family:Consolas,Menlo,monospace">` : ''}
+        <div style="display:flex;gap:8px;margin-top:11px;flex-wrap:wrap">
+          ${url ? `<button class="btn btn-primary btn-sm" id="clCopy">${icon('copy', 14)} 复制链接</button>
+          <button class="btn btn-secondary btn-sm" id="clOpen">${icon('share', 14)} 打开预览</button>` : ''}
+          ${res.image ? `<button class="btn ${url ? 'btn-secondary' : 'btn-primary'} btn-sm" id="clSave">${icon('download', 14)} 保存长图</button>` : ''}
+          <button class="btn btn-secondary btn-sm" id="clRegen">${icon('refresh', 14)} 重新生成</button>
+          <button class="btn btn-secondary btn-sm" id="clText">${icon('copy', 14)} 复制报价文本</button>
+        </div>
+        <div class="t-xs muted" style="margin-top:12px;line-height:1.7">
+          ${isWeb
+            ? `内容是一份<b>完整报价网页</b>（含 ${list.length} 项明细），手机浏览器、微信、电脑都能直接打开——可缩放可下拉，页面内自带「打印 / 保存 PDF」，客户想留档一键就能存。`
+            : isLocal
+              ? `内容是一份<b>报价长图</b>（含 ${list.length} 项明细），可直接保存后发图片给客户。`
+              : `内容是一份<b>报价长图快照</b>（含 ${list.length} 项明细）${isImg ? '，客户在手机上长按图片即可保存或转发' : ''}。`}
+          报价内容改动后，请点「重新生成」同步成最新版本。
+          ${url ? '<br>发送前建议先点「打开预览」，确认客户打开能看到内容。' : ''}
+          ${at ? `<br>本次生成：${esc(new Date(at).toLocaleString('zh-CN'))}` : ''}
+        </div>`;
+      };
+
+      const errHtml = (msg) => `
+        <div style="padding:14px;background:#fef2f2;border:1px solid #fecaca;border-radius:10px;color:#b91c1c;font-size:12.5px;line-height:1.7">
+          <b>生成失败</b><br>${esc(msg)}
+        </div>
+        <div style="margin-top:12px"><button class="btn btn-primary btn-sm" id="clRetry">重试</button></div>`;
+
+      const bindOk = (res) => {
+        const url = res.url || '';
+        const urlEl = box.querySelector('#clUrl');
+        if (urlEl) urlEl.onclick = () => urlEl.select();
+
+        const copyBtn = box.querySelector('#clCopy');
+        if (copyBtn) {
+          copyBtn.onclick = async () => {
+            if (urlEl) urlEl.select();
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(url);
+              } else {
+                document.execCommand('copy');
+              }
+              toast('链接已复制，发给客户即可', 'success');
+            } catch (e) {
+              try { document.execCommand('copy'); toast('链接已复制，发给客户即可', 'success'); }
+              catch (e2) { toast('复制失败，请手动选中复制', 'error'); }
+            }
+          };
+        }
+
+        const openBtn = box.querySelector('#clOpen');
+        if (openBtn) openBtn.onclick = () => window.open(url, '_blank');
+
+        box.querySelector('#clText').onclick = async () => {
+          const txt = buildClientQuoteText(q, list, org);
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) await navigator.clipboard.writeText(txt);
+            else throw new Error('no clipboard');
+            toast('报价文本已复制，粘贴到微信即可', 'success');
+          } catch (e) {
+            const w = window.open('', '_blank');
+            if (!w) { toast('复制失败，请允许弹出窗口', 'error'); return; }
+            w.document.write(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>报价文本</title></head>
+              <body style="margin:0"><div style="padding:12px;font-family:sans-serif;color:#334;font-size:13px">全选下方内容复制。</div>
+              <pre style="margin:0;padding:12px 16px;font:13px/1.7 "Microsoft YaHei",sans-serif;white-space:pre-wrap;background:#f8fafc">${esc(txt)}</pre></body></html>`);
+            w.document.close();
+          }
+        };
+
+        const saveBtn = box.querySelector('#clSave');
+        if (saveBtn) {
+          saveBtn.onclick = () => downloadQuoteImage(q.quote_number || '报价单', res.image);
+        }
+
+        box.querySelector('#clRegen').onclick = () => generate(true);
+      };
+
+      const generate = async (force) => {
+        if (!force) {
+          const c = readCache();
+          // 只认网页版缓存；旧的图片版缓存直接作废，重新生成升级为网页
+          if (c && c.url && c.format === 'html') {
+            const cached = { url: c.url, kind: c.kind || 'html', format: c.format || '' };
+            box.innerHTML = okHtml(cached, c.at);
+            bindOk(cached);
+            return;
+          }
+        }
+        box.innerHTML = `<div style="text-align:center;padding:40px 0">
+          <div class="spinner dark" style="width:22px;height:22px;margin:0 auto"></div>
+          <div class="t-sm muted mt12">正在生成客户报价页…</div>
+        </div>`;
+        try {
+          const r = await createClientLink(q, list, org);
+          if (r.url) writeCache({ url: r.url, kind: r.kind, format: r.format, at: Date.now() });
+          box.innerHTML = okHtml(r, Date.now());
+          bindOk(r);
+        } catch (e) {
+          box.innerHTML = errHtml(e.message || '未知错误');
+          const rb = box.querySelector('#clRetry');
+          if (rb) rb.onclick = () => generate(true);
+        }
+      };
+
+      generate(false);
+    },
   });
 }
 

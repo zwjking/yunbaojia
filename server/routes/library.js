@@ -5,10 +5,10 @@ const { db, uid, now } = require('../lib/db');
 const A = require('../lib/auth');
 const { ok, fail } = require('../lib/http');
 const { seedLibraryForOrg, resetOrgLibrary } = require('../lib/seed');
-const { GROUPS } = require('../../seed/library');
+const { GROUPS } = require('../lib/seed/library');
 
-function orgLibrary(user) {
-  return db.library.find((it) => it.org_id === user.org_id);
+async function orgLibrary(user) {
+  return await db.library.find((it) => it.org_id === user.org_id);
 }
 
 module.exports = function register(api) {
@@ -16,11 +16,11 @@ module.exports = function register(api) {
   /* ================= 工艺价格库 ================= */
 
   api.get('/price-library', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const q = req.query || {};
-    let list = orgLibrary(user);
-    if (!list.length) { seedLibraryForOrg(user.org_id); list = orgLibrary(user); }
+    let list = await orgLibrary(user);
+    if (!list.length) { await seedLibraryForOrg(user.org_id); list = await orgLibrary(user); }
     if (q.keyword) {
       const kw = String(q.keyword).toLowerCase();
       list = list.filter((x) => x.name.toLowerCase().includes(kw) || (x.tags || []).some((t) => t.includes(kw)));
@@ -35,7 +35,7 @@ module.exports = function register(api) {
   });
 
   api.get('/price-library/presets', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, [
       { code: 'default', name: '系统标准库', desc: '内置 180 条常用工艺，覆盖八大分类' },
@@ -46,39 +46,39 @@ module.exports = function register(api) {
   });
 
   api.post('/price-library/apply-preset', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const factor = { default: 1, economy: 0.88, quality: 1.15, premium: 1.35 }[body.code] || 1;
-    const list = orgLibrary(user);
-    const base = db.library.find((it) => !it.org_id);
-    list.forEach((it) => {
+    const list = await orgLibrary(user);
+    const base = await db.library.find((it) => !it.org_id);
+    for (const it of list) {
       const sys = base.find((x) => x.name === it.name);
       const p = sys ? sys.price : it.price / factor;
-      db.library.update(it.id, {
+      await db.library.update(it.id, {
         price: Math.round(p * factor * 100) / 100,
         cost: Math.round((sys ? sys.cost : it.cost / factor) * factor * 100) / 100,
       });
-    });
-    db.library.flush();
+    }
+    await db.library.flush();
     ok(res, { applied: body.code, count: list.length, message: `已应用预设，共更新 ${list.length} 条工艺价格。` });
   });
 
   api.post('/price-library/reset', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const n = resetOrgLibrary(user.org_id);
+    const n = await resetOrgLibrary(user.org_id);
     ok(res, { ok: true, count: n, message: `已重置为系统标准库，共 ${n} 条。` });
   });
 
   api.post('/price-library/import', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const rows = Array.isArray(body.items) ? body.items : [];
     if (!rows.length) return fail(res, '没有可导入的数据。');
     let added = 0, updated = 0;
     for (const r of rows) {
       if (!r.name) continue;
-      const exist = db.library.findOne((x) => x.org_id === user.org_id && x.name === r.name);
+      const exist = await db.library.findOne((x) => x.org_id === user.org_id && x.name === r.name);
       const data = {
         group_key: r.group_key || 'misc',
         group_name: r.group_name || '未分类',
@@ -89,26 +89,26 @@ module.exports = function register(api) {
         craft: r.craft || '',
         tags: r.tags || [],
       };
-      if (exist) { db.library.update(exist.id, data); updated += 1; }
-      else { db.library.insert({ id: uid(), org_id: user.org_id, source: 'import', created_at: now(), ...data }); added += 1; }
+      if (exist) { await db.library.update(exist.id, data); updated += 1; }
+      else { await db.library.insert({ id: uid(), org_id: user.org_id, source: "import", created_at: now(), ...data }); added += 1; }
     }
-    db.library.flush();
+    await db.library.flush();
     ok(res, { added, updated, message: `导入完成：新增 ${added} 条，更新 ${updated} 条。` });
   });
 
   api.get('/price-library/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const it = db.library.findOne({ id: params.id });
+    const it = await db.library.findOne({ id: params.id });
     if (!it) return fail(res, '工艺不存在。', 404);
     ok(res, it);
   });
 
   api.post('/price-library', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!body.name) return fail(res, '请填写工艺名称。');
-    const item = db.library.insert({
+    const item = await db.library.insert({
       id: uid(), org_id: user.org_id, source: 'custom', created_at: now(),
       group_key: body.group_key || 'misc',
       group_name: body.group_name || GROUPS.find((g) => g.key === body.group_key)?.name || '未分类',
@@ -120,36 +120,36 @@ module.exports = function register(api) {
   });
 
   api.put('/price-library/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const it = db.library.findOne({ id: params.id });
+    const it = await db.library.findOne({ id: params.id });
     if (!it) return fail(res, '工艺不存在。', 404);
     const allow = ['name', 'unit', 'price', 'cost', 'craft', 'tags', 'group_key', 'group_name'];
     const patch = {};
     allow.forEach((k) => { if (body[k] !== undefined) patch[k] = body[k]; });
-    ok(res, db.library.update(params.id, patch));
+    ok(res, await db.library.update(params.id, patch));
   });
 
   api.del('/price-library/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    db.library.remove(params.id);
+    await db.library.remove(params.id);
     ok(res, { ok: true });
   });
 
   /* ================= 户型模板 ================= */
 
   api.get('/room-templates', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, db.templates.find((t) => t.org_id === user.org_id)
+    ok(res, await db.templates.find((t) => t.org_id === user.org_id)
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.post('/room-templates', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const tpl = db.templates.insert({
+    const tpl = await db.templates.insert({
       id: uid(), org_id: user.org_id, user_id: user.id, created_at: now(),
       name: body.name || '未命名模板',
       layout: body.layout || '',
@@ -166,9 +166,9 @@ module.exports = function register(api) {
   });
 
   api.put('/room-templates/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const t = db.templates.findOne({ id: params.id });
+    const t = await db.templates.findOne({ id: params.id });
     if (!t || t.org_id !== user.org_id) return fail(res, '模板不存在。', 404);
     const allow = ['name', 'layout', 'building_area', 'building_type', 'house_type', 'city', 'tier', 'spaces', 'note'];
     const patch = {};
@@ -177,17 +177,17 @@ module.exports = function register(api) {
   });
 
   api.del('/room-templates/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    db.templates.remove(params.id);
+    await db.templates.remove(params.id);
     ok(res, { ok: true });
   });
 
   /** 本地匹配：按面积 / 户型 / 装修类型打分（免费，不扣点数） */
   api.post('/ai/templates/match-rank', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const all = db.templates.find((t) => t.org_id === user.org_id);
+    const all = await db.templates.find((t) => t.org_id === user.org_id);
     const area = Number(body.building_area) || 0;
     const layout = String(body.layout || '');
     const houseType = String(body.house_type || '');

@@ -26,6 +26,10 @@
   </div>
   <div id="toast-host"></div>
   <div id="modal-host"></div>
+  <!-- 云函数部署时注入 API 基础地址 -->
+  <script>
+    window.__HQ_API_BASE__ = window.__HQ_API_BASE__ || '/api/v1';
+  </script>
   <!--
     演示模式引导层：在静态托管（GitHub Pages 等）上把 /api/v1 请求接管到
     浏览器端数据层。必须排在 main.js 之前。本地跑 server.js 时会自动让行，
@@ -38,5 +42,12 @@
       本系统需要启用 JavaScript 才能使用。
     </div>
   </noscript>
+  <!-- PocketBay Analytics：站点访问统计（部署到 PocketBay 时启用） -->
+  <script src="https://pocketbay.com/api/analytics/pb-insights.js?v=3"></script>
+  <script>
+    if (window.pb && typeof window.pb.init === 'function') {
+      window.pb.init({ projectKey: "pb_pk_LBqxgQrseP8Atx7RzPqrDWsAqfQws34L" });
+    }
+  </script>
 </body>
 </html>

@@ -9,6 +9,7 @@ const { ok, fail } = require('../lib/http');
 const PLANS = [
   {
     key: 'free', name: '免费版', tag: '体验入门', price: '¥0', cycle: '永久免费',
+    credits: 30,
     monthly: 0, yearly: 0,
     note: '随便新建、编辑、在线预览报价；出成品（导出 / 分享）时再按次购买。',
     cta: '免费开始', borderColor: '#94a3b8', glowColor: 'rgba(148,163,184,0.3)',
@@ -17,6 +18,7 @@ const PLANS = [
   },
   {
     key: 'personal', name: '普通版（按次）', tag: '按需出单', price: '¥9.9', cycle: '/ 1 次出单',
+    credits: 0,
     monthly: 0, yearly: 0,
     note: '9.9 元买 1 次，1 次 = 出一份报价（导出/出单）；同一份解锁后反复导出不重复扣次。',
     cta: '购买出单次数', borderColor: '#1565f5', glowColor: 'rgba(21,101,245,0.22)',
@@ -25,6 +27,7 @@ const PLANS = [
   },
   {
     key: 'plus', name: 'Plus 版', tag: '推荐 · 不限次', price: '¥38', cycle: '/ 月',
+    credits: 1000,
     monthly: 38, yearlyMonthly: 32, yearlyTotal: 388,
     note: '包月不限次导出，AI 全程协助、漏项提醒、价格风险预警，高频出单更划算。',
     cta: '开通 Plus 版', highlight: true, borderColor: '#7c3aed', glowColor: 'rgba(124,58,237,0.28)',
@@ -33,6 +36,7 @@ const PLANS = [
   },
   {
     key: 'enterprise', name: '企业版', tag: '团队使用', price: '定制', cycle: '按需报价',
+    credits: 5000,
     monthly: 0, yearly: 0,
     note: '席位 / 价格库 / 审批流按团队规模定制，价格一对一沟通。',
     cta: '联系开通', borderColor: '#0891b2', glowColor: 'rgba(8,145,178,0.22)',
@@ -62,21 +66,21 @@ module.exports = function register(api) {
   api.get('/subscriptions/plans', async (req, res) => ok(res, PLANS));
 
   api.get('/subscriptions/orders', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.kind === 'subscription')
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.post('/subscriptions/purchase', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const plan = PLANS.find((p) => p.key === body.plan);
     if (!plan) return fail(res, '套餐不存在。');
     const cycle = body.cycle === 'yearly' ? 'yearly' : 'monthly';
     const amount = cycle === 'yearly' ? (plan.yearlyTotal || plan.monthly * 12) : plan.monthly;
     if (!amount) return fail(res, '该套餐不支持在线购买，请联系我们开通。');
-    const order = db.orders.insert({
+    const order = await db.orders.insert({
       id: uid(), org_id: user.org_id, user_id: user.id, kind: 'subscription',
       order_no: genOrderNo('SUB'), plan: plan.key, plan_name: plan.name, cycle,
       amount, status: 'pending', created_at: now(),
@@ -84,33 +88,42 @@ module.exports = function register(api) {
     ok(res, order, 201);
   });
 
-  const settleSubscription = (order) => {
+  /* 结算：写用户套餐 + 有效期 + 赠送积分，并同步团队套餐。
+   * 【坑】原实现取 PLANS[].monthly_credits_bonus —— 该字段从来不存在，
+   *       NaN || 0 得 0，于是用户走一次在线开通积分会被清零。
+   *       现在改用 PLANS[].credits（与 auth.js 的注册/月度发放同源）。 */
+  const settleSubscription = async (order) => {
     const months = order.cycle === 'yearly' ? 12 : 1;
     const expires = new Date(Date.now() + months * 30 * 86400000).toISOString();
-    db.users.update(order.user_id, {
+    const curUser = await db.users.findOne({ id: order.user_id });
+    if (!curUser) return false;
+    const cur = curUser.credits || 0;
+    const grant = (PLANS.find((p) => p.key === order.plan) || {}).credits || 0;
+    const okUser = await db.users.update(order.user_id, {
       plan: order.plan,
       plan_expires_at: expires,
-      credits: (db.users.findOne({ id: order.user_id }).credits || 0) +
-        (PLANS.find((p) => p.key === order.plan) || {}).monthly_credits_bonus || 0,
+      credits: cur + grant,
+      credits_month: new Date().toISOString().slice(0, 7),
     });
-    const org = db.orgs.findOne({ id: order.org_id });
-    if (org) db.orgs.update(org.id, { plan: order.plan });
+    const org = await db.orgs.findOne({ id: order.org_id });
+    const okOrg = org ? await db.orgs.update(org.id, { plan: order.plan }) : true;
+    return !!okUser && !!okOrg;
   };
 
   api.post('/subscriptions/orders/:id/pay', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: params.id });
+    const order = await db.orders.findOne({ id: params.id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
-    db.orders.update(order.id, { status: 'paid', paid_at: now(), pay_method: body.method || '模拟支付' });
-    settleSubscription(order);
+    await db.orders.update(order.id, { status: 'paid', paid_at: now(), pay_method: body.method || '模拟支付' });
+    await settleSubscription(order);
     ok(res, { ...db.orders.findOne({ id: order.id }), message: '支付成功，套餐已生效。' });
   });
 
   api.post('/subscriptions/orders/:id/cancel', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: params.id });
+    const order = await db.orders.findOne({ id: params.id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
     ok(res, db.orders.update(order.id, { status: 'cancelled' }));
   });
@@ -119,24 +132,24 @@ module.exports = function register(api) {
   api.get('/ai-credits/packs', async (req, res) => ok(res, CREDIT_PACKS));
 
   api.get('/ai-credits/balance', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, { credits: user.credits || 0, unlimited: !!user.is_platform_admin, month: user.credits_month });
   });
 
   api.get('/ai-credits/purchases', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.kind === 'credits')
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.post('/ai-credits/purchases', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const pack = CREDIT_PACKS.find((p) => p.code === body.pack_code);
     if (!pack) return fail(res, '充值包不存在。');
-    const order = db.orders.insert({
+    const order = await db.orders.insert({
       id: uid(), org_id: user.org_id, user_id: user.id, kind: 'credits',
       order_no: genOrderNo('CRD'), pack_code: pack.code, pack_name: pack.name,
       call_count: pack.credits + (pack.bonus || 0), amount: pack.price,
@@ -146,9 +159,9 @@ module.exports = function register(api) {
   });
 
   api.post('/ai-credits/purchases/:id/pay', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: params.id });
+    const order = await db.orders.findOne({ id: params.id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
     db.orders.update(order.id, { status: 'paid', paid_at: now(), pay_method: body.method || '模拟支付' });
     db.users.update(user.id, { credits: (user.credits || 0) + (order.call_count || 0) });
@@ -156,7 +169,7 @@ module.exports = function register(api) {
   });
 
   api.post('/ai-credits/purchases/:id/cancel', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.update(params.id, { status: 'cancelled' }));
   });
@@ -165,7 +178,7 @@ module.exports = function register(api) {
   api.get('/report-credits/packs', async (req, res) => ok(res, EXPORT_PACKS));
 
   api.get('/report-credits/balance', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, {
       purchased: user.export_purchased || 0,
@@ -176,17 +189,17 @@ module.exports = function register(api) {
   });
 
   api.get('/report-credits/purchases', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.kind === 'export'));
   });
 
   api.post('/report-credits/purchases', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const pack = EXPORT_PACKS.find((p) => p.code === body.pack_code);
     if (!pack) return fail(res, '次数包不存在。');
-    const order = db.orders.insert({
+    const order = await db.orders.insert({
       id: uid(), org_id: user.org_id, user_id: user.id, kind: 'export',
       order_no: genOrderNo('EXP'), pack_code: pack.code, pack_name: pack.name,
       call_count: pack.count, amount: pack.price, status: 'pending', created_at: now(),
@@ -195,9 +208,9 @@ module.exports = function register(api) {
   });
 
   api.post('/report-credits/purchases/:id/pay', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: params.id });
+    const order = await db.orders.findOne({ id: params.id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
     db.orders.update(order.id, { status: 'paid', paid_at: now(), pay_method: body.method || '模拟支付' });
     db.users.update(user.id, { export_purchased: (user.export_purchased || 0) + (order.call_count || 0) });
@@ -206,7 +219,7 @@ module.exports = function register(api) {
 
   /* ---------------- 发票 ---------------- */
   api.get('/invoices/records', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.invoice_requested)
       .map((o) => ({
@@ -217,17 +230,17 @@ module.exports = function register(api) {
   });
 
   api.get('/invoices/invoiceable-orders', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.status === 'paid' && !o.invoice_requested));
   });
 
   api.post('/invoices/records', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const ids = Array.isArray(body.order_ids) ? body.order_ids : [];
     if (!ids.length) return fail(res, '请选择要开票的订单。');
-    ids.forEach((id) => db.orders.update(id, {
+    ids.forEach(async (id) => await db.orders.update(id, {
       invoice_requested: true, invoice_status: 'pending',
       invoice_title: body.title || '', invoice_tax_no: body.tax_no || '',
     }));
@@ -241,9 +254,9 @@ module.exports = function register(api) {
   }));
 
   api.post('/refunds', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: body.order_id });
+    const order = await db.orders.findOne({ id: body.order_id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
     ok(res, db.notifications.insert({
       id: uid(), org_id: user.org_id, type: 'refund_request', order_id: order.id,

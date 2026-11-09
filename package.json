@@ -1,0 +1,14 @@
+{
+  "name": "homequote-cloud",
+  "version": "1.0.0",
+  "private": true,
+  "description": "云报价 · 家装报价系统 (PocketBay)",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

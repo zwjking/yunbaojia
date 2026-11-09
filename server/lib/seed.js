@@ -2,26 +2,26 @@
  * 数据初始化：系统内置工艺库 + 组织副本 + 演示数据
  */
 const { db, uid, now } = require('./db');
-const { buildItems, GROUPS } = require('../../seed/library');
+const { buildItems, GROUPS } = require('./seed/library');
 
 /** 确保系统内置工艺库存在（org_id 为 null） */
-function initSystemLibrary() {
-  const exist = db.library.count((it) => !it.org_id);
+async function initSystemLibrary() {
+  const exist = await db.library.count((it) => !it.org_id);
   if (exist > 0) return exist;
   const items = buildItems().map((it) => ({ ...it, org_id: null, created_at: now() }));
-  db.library.insertMany(items);
-  db.library.flush();
+  await db.library.insertMany(items);
+  await db.library.flush();
   console.log(`[seed] 已初始化系统工艺库 ${items.length} 条`);
   return items.length;
 }
 
 /** 为新组织复制一份可编辑的工艺库副本 */
-function seedLibraryForOrg(orgId, opts = {}) {
-  const exist = db.library.count((it) => it.org_id === orgId);
+async function seedLibraryForOrg(orgId, opts = {}) {
+  const exist = await db.library.count((it) => it.org_id === orgId);
   if (exist > 0 && !opts.force) return exist;
-  if (exist > 0) db.library.removeWhere((it) => it.org_id === orgId);
+  if (exist > 0) await db.library.removeWhere((it) => it.org_id === orgId);
 
-  const systemItems = db.library.find((it) => !it.org_id);
+  const systemItems = await db.library.find((it) => !it.org_id);
   const src = systemItems.length ? systemItems : buildItems().map((it) => ({ ...it, org_id: null }));
   const copies = src.map((it) => ({
     ...it,
@@ -31,19 +31,20 @@ function seedLibraryForOrg(orgId, opts = {}) {
     group_key: it.group_key || (GROUPS.find((g) => g.name === it.group_name) || {}).key || 'misc',
     created_at: now(),
   }));
-  db.library.insertMany(copies);
-  db.library.flush();
+  await db.library.insertMany(copies);
+  await db.library.flush();
   return copies.length;
 }
 
 /** 重置组织工艺库到系统默认 */
-function resetOrgLibrary(orgId) {
+async function resetOrgLibrary(orgId) {
   return seedLibraryForOrg(orgId, { force: true });
 }
 
 /** 为演示账号生成示例空间模板（用于模板管理页与智能造价复用） */
-function seedDemoTemplates(userId, orgId) {
-  if (db.templates.count((t) => t.org_id === orgId)) return 0;
+async function seedDemoTemplates(userId, orgId) {
+  const exist = await db.templates.count((t) => t.org_id === orgId);
+  if (exist > 0) return 0;
 
   const tpls = [
     {
@@ -81,32 +82,35 @@ function seedDemoTemplates(userId, orgId) {
     },
   ];
 
-  const docs = tpls.map((t) => db.templates.insert({
-    id: uid(),
-    org_id: orgId,
-    user_id: userId,
-    building_type: '高层',
-    house_type: '新房',
-    city: '合肥',
-    source: 'preset',
-    created_at: now(),
-    ...t,
+  const docs = await Promise.all(tpls.map(async (t) => {
+    return await db.templates.insert({
+      id: uid(),
+      org_id: orgId,
+      user_id: userId,
+      building_type: '高层',
+      house_type: '新房',
+      city: '合肥',
+      source: 'preset',
+      created_at: now(),
+      ...t,
+    });
   }));
-  db.templates.flush();
+  await db.templates.flush();
   return docs.length;
 }
 
 /** 为演示账号生成示例报价 */
-function seedDemoQuotes(userId, orgId) {
-  if (db.quotes.count((q) => q.org_id === orgId)) return 0;
+async function seedDemoQuotes(userId, orgId) {
+  const exist = await db.quotes.count((q) => q.org_id === orgId);
+  if (exist > 0) return 0;
 
-  seedDemoTemplates(userId, orgId);
+  await seedDemoTemplates(userId, orgId);
 
-  const customers = [
+  const customers = await Promise.all([
     { name: '王女士', phone: '13805610001', community: '华润·幸福里', building_area: 108, layout: '三室两厅两卫' },
     { name: '李先生', phone: '13905610002', community: '万科·森林公园', building_area: 89, layout: '两室两厅一卫' },
     { name: '张女士', phone: '13705610003', community: '保利·西山林语', building_area: 132, layout: '四室两厅两卫' },
-  ].map((c) => db.customers.insert({ id: uid(), org_id: orgId, ...c, source: '到店', status: 'following', created_at: now() }));
+  ].map(async (c) => await db.customers.insert({ id: uid(), org_id: orgId, ...c, source: '到店', status: 'following', created_at: now() })));
 
   const ai = require('./ai');
   const demo = [
@@ -117,7 +121,7 @@ function seedDemoQuotes(userId, orgId) {
 
   let n = 0;
   for (const d of demo) {
-    const est = ai.estimate({
+    const est = await ai.estimate({
       city: d.city,
       building_area: d.customer.building_area,
       layout: d.customer.layout,
@@ -130,11 +134,12 @@ function seedDemoQuotes(userId, orgId) {
     });
     const qid = uid();
     const total = est.total;
-    const quote = db.quotes.insert({
+    const quoteNumber = await genQuoteNo(orgId);
+    const quote = await db.quotes.insert({
       id: qid,
       org_id: orgId,
       user_id: userId,
-      quote_number: genQuoteNo(orgId),
+      quote_number: quoteNumber,
       title: `${d.customer.community} ${d.customer.building_area}㎡ ${d.customer.layout} 装修报价`,
       customer_id: d.customer.id,
       customer_name: d.customer.name,
@@ -158,20 +163,20 @@ function seedDemoQuotes(userId, orgId) {
       created_at: new Date(Date.now() - d.days * 86400000).toISOString(),
       updated_at: now(),
     });
-    db.quote_items.insertMany(
+    await db.quote_items.insertMany(
       est.items.map((it) => ({ ...it, id: uid(), quote_id: qid, org_id: orgId, created_at: now() }))
     );
     n += 1;
   }
-  db.quotes.flush();
-  db.quote_items.flush();
+  await db.quotes.flush();
+  await db.quote_items.flush();
   return n;
 }
 
-function genQuoteNo(orgId) {
+async function genQuoteNo(orgId) {
   const d = new Date();
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-  const seq = db.quotes.count((q) => q.org_id === orgId) + 1;
+  const seq = (await db.quotes.count((q) => q.org_id === orgId)) + 1;
   return `BJ${ymd}${String(seq).padStart(3, '0')}`;
 }
 

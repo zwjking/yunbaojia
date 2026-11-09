@@ -1,0 +1,15 @@
+{
+  "name": "homequote-cloud",
+  "version": "1.0.0",
+  "description": "云报价 · 家装报价系统 - CloudBase HTTP 云函数",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@cloudbase/js-sdk": "^2.10.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

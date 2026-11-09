@@ -30,7 +30,7 @@ export function authPage(mode = 'login') {
       </div>
       <div class="auth-tip" id="authTip">
         ${isLogin
-    ? '演示账号：<b>13800000000</b> / 密码 <b>123456</b>　·　也可用手机号 + 验证码登录'
+    ? '支持手机号 + 密码，或手机号 + 验证码登录'
     : '注册即赠 30 积分 / 月，可立即体验 AI 智能造价'}
       </div>
     </div>
@@ -47,11 +47,11 @@ function loginForm() {
     <div id="modePassword">
       <div class="field">
         <label class="field-label">手机号 / 邮箱</label>
-        <input class="input" id="lgAccount" placeholder="请输入手机号" value="13800000000" autocomplete="username">
+        <input class="input" id="lgAccount" placeholder="请输入手机号" autocomplete="username">
       </div>
       <div class="field" style="margin-top:14px">
         <label class="field-label">密码</label>
-        <input class="input" id="lgPwd" type="password" placeholder="请输入密码" value="123456" autocomplete="current-password">
+        <input class="input" id="lgPwd" type="password" placeholder="请输入密码" autocomplete="current-password">
       </div>
       <button class="btn btn-primary btn-lg btn-block" id="btnLogin" style="margin-top:20px">
         登录 ${icon('arrowRight', 16)}

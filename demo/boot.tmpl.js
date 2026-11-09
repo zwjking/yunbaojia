@@ -11,10 +11,11 @@ import './bundle.js?v=__VERSION__';
 
 const D = window.__HQ_DEMO__;
 const params = new URLSearchParams(location.search);
-const LOCAL_HOSTS = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/;
+// 同域自带真实后端的托管（本机 Node 服务 / CloudBase / PocketBay 等）走真实接口
+const REAL_HOSTS = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$|\.(tcloudbaseapp\.com|pocketbay\.app)$/i;
 const flag = params.get('demo');
-// 默认策略：本机（跑着 Node 后端）走真实接口，其它任何静态托管都启用演示模式
-const ENABLED = flag === '1' ? true : flag === '0' ? false : !LOCAL_HOSTS.test(location.hostname);
+// 默认策略：同域有真实后端时走真实接口，其它纯静态托管（如 GitHub Pages）才启用演示模式
+const ENABLED = flag === '1' ? true : flag === '0' ? false : !REAL_HOSTS.test(location.hostname);
 
 if (params.get('demo-reset') === '1') {
   D.resetAll();

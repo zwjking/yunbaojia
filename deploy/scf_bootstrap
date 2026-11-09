@@ -1,0 +1,7 @@
+#!/bin/bash
+# CloudBase HTTP Function bootstrap script
+# 必须与 runtime 匹配：Nodejs18 使用 /var/lang/node18/bin/node
+# Nodejs16 使用 /var/lang/node16/bin/node
+# Nodejs14 使用 /var/lang/node14/bin/node
+
+exec /var/lang/node18/bin/node index.js

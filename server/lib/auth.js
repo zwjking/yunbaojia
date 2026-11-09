@@ -2,10 +2,35 @@
  * 认证与授权：密码哈希 + JWT（HS256，零依赖手写）
  */
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { db, uid, now } = require('./db');
 const { fail } = require('./http');
 
-const SECRET = process.env.HQ_SECRET || 'homequote-cloud-dev-secret-2026';
+/**
+ * JWT 签名秘钥解析：
+ * 1) 显式设置 HQ_SECRET 时优先使用（生产环境推荐）；
+ * 2) 否则在持久卷（POCKETBAY_DATA_DIR，平台注入）下生成并持久化一个随机秘钥，
+ *    保证重启后秘钥稳定、已签发 token 仍有效；本地开发落到 server/data。
+ * 这样在未配置 HQ_SECRET 的托管环境也能正常启动。
+ */
+function resolveSecret() {
+  if (process.env.HQ_SECRET) return process.env.HQ_SECRET;
+  const dataDir = process.env.POCKETBAY_DATA_DIR
+    ? path.join(process.env.POCKETBAY_DATA_DIR, 'homequote')
+    : path.join(__dirname, '..', 'data');
+  try { fs.mkdirSync(dataDir, { recursive: true }); } catch (e) { /* ignore */ }
+  const secretFile = path.join(dataDir, '.hq_secret');
+  try {
+    if (fs.existsSync(secretFile)) return fs.readFileSync(secretFile, 'utf8').trim();
+    const s = crypto.randomBytes(32).toString('hex');
+    try { fs.writeFileSync(secretFile, s, { mode: 0o600 }); } catch (e) { /* ignore */ }
+    return s;
+  } catch (e) {
+    return 'hq-dev-secret-' + crypto.randomBytes(8).toString('hex');
+  }
+}
+const SECRET = resolveSecret();
 const TOKEN_TTL = 60 * 60 * 24 * 7;      // 7 天
 const REFRESH_TTL = 60 * 60 * 24 * 30;   // 30 天
 
@@ -68,20 +93,20 @@ function issueTokens(user) {
 }
 
 /* ---------------- 中间件 ---------------- */
-function parseAuth(req) {
+async function parseAuth(req) {
   const raw = req.headers.authorization || req.headers.Authorization || '';
   const token = raw.startsWith('Bearer ') ? raw.slice(7) : (raw || '');
   if (!token) return null;
   const payload = verify(token);
   if (!payload || !payload.sub) return null;
-  const user = db.users.findOne({ id: payload.sub });
+  const user = await db.users.findOne({ id: payload.sub });
   if (!user) return null;
   if (user.status === 'disabled') return null;
   return user;
 }
 
-function requireAuth(req, res) {
-  const user = parseAuth(req);
+async function requireAuth(req, res) {
+  const user = await parseAuth(req);
   if (!user) {
     fail(res, '登录状态已失效，请重新登录。', 401, 'UNAUTHORIZED');
     return null;
@@ -90,8 +115,8 @@ function requireAuth(req, res) {
   return user;
 }
 
-function requireAdmin(req, res) {
-  const user = requireAuth(req, res);
+async function requireAdmin(req, res) {
+  const user = await requireAuth(req, res);
   if (!user) return null;
   if (!['owner', 'admin'].includes(user.role) && !user.is_platform_admin) {
     fail(res, '仅管理员可执行此操作。', 403, 'FORBIDDEN');
@@ -100,8 +125,8 @@ function requireAdmin(req, res) {
   return user;
 }
 
-function requirePlatformAdmin(req, res) {
-  const user = requireAuth(req, res);
+async function requirePlatformAdmin(req, res) {
+  const user = await requireAuth(req, res);
   if (!user) return null;
   if (!user.is_platform_admin) {
     fail(res, '仅平台管理员可执行此操作。', 403, 'FORBIDDEN');
@@ -113,7 +138,6 @@ function requirePlatformAdmin(req, res) {
 /* ---------------- 校验 ---------------- */
 function validPhone(p) { return /^1[3-9]\d{9}$/.test(String(p || '').trim()); }
 function validEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || '').trim()); }
-
 function publicUser(u) {
   if (!u) return null;
   const { password_hash, ...rest } = u;

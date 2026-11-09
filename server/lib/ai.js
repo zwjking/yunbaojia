@@ -137,51 +137,54 @@ const FEATURE_COSTS = {
 };
 
 /* =========================================================
-   二、工程量计算模型
+   二、工程量计算模型（含 DB 查询均走 async）
    ========================================================= */
 
-function libItem(name, orgId) {
+/** 缓存：按 (name, orgId) 为 key 的已查询 item，避免重复 DB 调用 */
+const _libCache = new Map();
+
+async function libItem(name, orgId) {
+  const key = `${name}::${orgId || 'sys'}`;
+  if (_libCache.has(key)) return _libCache.get(key);
   // 优先取系统内置基准库，其次取组织自有库
-  return (
-    db.library.findOne((it) => it.name === name && !it.org_id) ||
-    (orgId ? db.library.findOne((it) => it.name === name && it.org_id === orgId) : null) ||
-    db.library.findOne((it) => it.name === name) ||
-    null
-  );
+  const r =
+    (await db.library.findOne((it) => it.name === name && !it.org_id)) ||
+    (orgId ? await db.library.findOne((it) => it.name === name && it.org_id === orgId) : null) ||
+    (await db.library.findOne((it) => it.name === name)) ||
+    null;
+  _libCache.set(key, r);
+  return r;
 }
 
-function libPrice(name, fallback) {
-  const it = libItem(name);
+async function libPrice(name, fallback) {
+  const it = await libItem(name);
   return it ? it.price : fallback;
 }
 
-function libCost(name, fallbackRatio = 0.66) {
-  const it = libItem(name);
-  if (it) return it.cost || Math.round(it.price * 0.68 * 100) / 100;
-  return Math.round((libPrice(name, 0) || 0) * fallbackRatio * 100) / 100;
+async function libCost(name, fallbackRatio = 0.66) {
+  const it = await libItem(name);
+  if (it) return it.cost || Math.round(it.price * 0.66 * 100) / 100;
+  return Math.round(((await libPrice(name, 0)) || 0) * fallbackRatio * 100) / 100;
 }
 
-function libUnit(name, fallback) {
-  const it = libItem(name);
+async function libUnit(name, fallback) {
+  const it = await libItem(name);
   return it ? it.unit : fallback;
 }
 
 /**
  * 取当前组织可用的工艺库：优先该组织自有副本，否则回落到系统基准库
- * 注意：绝不返回全库，否则会把其他组织的数据混进来
  */
-function scopeItems(orgId) {
-  const own = orgId ? db.library.find((it) => it.org_id === orgId) : [];
+async function scopeItems(orgId) {
+  const own = orgId ? await db.library.find((it) => it.org_id === orgId) : [];
   if (own.length) return own;
   return db.library.find((it) => !it.org_id);
 }
 
 /**
  * 按空间生成报价条目
- * @param {Object} p 项目参数
- * @returns {{items:Array, assumptions:Array}}
  */
-function generateQuoteItems(p) {
+async function generateQuoteItems(p) {
   const {
     city = '',
     building_area = 100,
@@ -223,11 +226,12 @@ function generateQuoteItems(p) {
 
   const items = [];
   const assumptions = [];
-  const push = (group, name, qty, unitOverride) => {
-    const unit = unitOverride || libUnit(name, '项');
-    const price = Math.round(libPrice(name, 50) * k * 100) / 100;
-    const cost = Math.round(libCost(name) * k * 100) / 100;
+  const push = async (group, name, qty, unitOverride) => {
+    const unit = unitOverride || (await libUnit(name, '项'));
+    const price = Math.round((await libPrice(name, 50)) * k * 100) / 100;
+    const cost = Math.round(await libCost(name) * k * 100) / 100;
     if (qty <= 0) return;
+    const item = await libItem(name);
     items.push({
       group_name: group,
       name,
@@ -236,105 +240,105 @@ function generateQuoteItems(p) {
       unit_price: price,
       cost_price: cost,
       amount: Math.round(price * qty * 100) / 100,
-      craft: (libItem(name) || {}).craft || '',
+      craft: item ? item.craft : '',
       source: 'ai',
     });
   };
 
   /* --- 1. 拆除与保护（老房 / 翻新） --- */
   if (isOld) {
-    push('拆除与保护', '旧墙皮铲除', totalUsable * 2.4);
-    push('拆除与保护', '地面瓷砖拆除', totalUsable * 0.9);
-    push('拆除与保护', '墙体拆除（非承重）', Math.max(0, totalUsable * 0.06));
-    push('拆除与保护', '洁具拆除', 2);
-    push('拆除与保护', '垃圾装袋外运', Math.max(3, area * 0.09));
+    await push('拆除与保护', '旧墙皮铲除', totalUsable * 2.4);
+    await push('拆除与保护', '地面瓷砖拆除', totalUsable * 0.9);
+    await push('拆除与保护', '墙体拆除（非承重）', Math.max(0, totalUsable * 0.06));
+    await push('拆除与保护', '洁具拆除', 2);
+    await push('拆除与保护', '垃圾装袋外运', Math.max(3, area * 0.09));
   }
-  push('拆除与保护', '成品保护（地面）', totalUsable * 0.9);
-  push('拆除与保护', '成品保护（门窗家具）', 1);
+  await push('拆除与保护', '成品保护（地面）', totalUsable * 0.9);
+  await push('拆除与保护', '成品保护（门窗家具）', 1);
   if (!has_elevator && floor > 3) {
-    push('拆除与保护', '上楼费（3层以上每层）', floor - 3);
+    await push('拆除与保护', '上楼费（3层以上每层）', floor - 3);
   }
 
   /* --- 2. 水电工程 --- */
   const wireLen = isOld ? area * 4.2 : area * 3.2;
   const pipeLen = isOld ? area * 0.85 : area * 0.6;
-  push('水电工程', '强电布线 2.5mm²（暗线含开槽）', wireLen);
-  push('水电工程', '强电布线 4mm²（空调/厨房）', area * 0.9);
-  push('水电工程', '给水管改造 PPR（暗管含开槽）', pipeLen);
-  push('水电工程', '排水管改造 PVC', area * 0.35);
-  push('水电工程', '弱电布线（超五类网线）', area * 0.8);
-  push('水电工程', '电线开槽（砖墙）', wireLen * 0.7);
-  push('水电工程', '底盒安装', Math.round(area * 0.55));
-  push('水电工程', '水管试压', 1);
-  push('水电工程', '配电箱安装', isOld ? 1 : 0);
-  push('水电工程', '开关插座安装（五孔）', Math.round(area * 0.45));
-  push('水电工程', '地漏安装', Math.max(2, Math.round(bathArea / 3)));
+  await push('水电工程', '强电布线 2.5mm²（暗线含开槽）', wireLen);
+  await push('水电工程', '强电布线 4mm²（空调/厨房）', area * 0.9);
+  await push('水电工程', '给水管改造 PPR（暗管含开槽）', pipeLen);
+  await push('水电工程', '排水管改造 PVC', area * 0.35);
+  await push('水电工程', '弱电布线（超五类网线）', area * 0.8);
+  await push('水电工程', '电线开槽（砖墙）', wireLen * 0.7);
+  await push('水电工程', '底盒安装', Math.round(area * 0.55));
+  await push('水电工程', '水管试压', 1);
+  await push('水电工程', '配电箱安装', isOld ? 1 : 0);
+  await push('水电工程', '开关插座安装（五孔）', Math.round(area * 0.45));
+  await push('水电工程', '地漏安装', Math.max(2, Math.round(bathArea / 3)));
 
   /* --- 3. 泥瓦工程 --- */
-  push('泥瓦工程', '地面现拌砂浆找平', totalUsable * 0.9);
-  push('泥瓦工程', '厨卫墙地面防水（聚合物水泥基三遍）', (kitchenArea + bathArea) * 1.75);
-  push('泥瓦工程', '闭水试验', 1);
-  push('泥瓦工程', '墙砖薄贴（300×600）', kitchenArea * 2.2 + bathArea * 3.4);
-  push('泥瓦工程', '地砖薄贴（800×800）', totalUsable * 0.78);
-  push('泥瓦工程', '瓷砖美缝', (kitchenArea * 2.2 + bathArea * 3.4 + totalUsable * 0.78) * 0.85);
-  push('泥瓦工程', '踢脚线安装（瓷砖/石材）', totalUsable * 0.32);
-  push('泥瓦工程', '门槛石/窗台石安装', Math.max(4, Object.keys(spaceMap).length * 0.9));
-  push('泥瓦工程', '厨卫包立管', Math.max(1, Math.round((kitchenArea + bathArea) / 12)));
-  push('泥瓦工程', '墙面拉毛处理', kitchenArea * 2.2 + bathArea * 3.4);
-  push('泥瓦工程', '墙面界面剂（墙固）', totalUsable * 2.4);
+  await push('泥瓦工程', '地面现拌砂浆找平', totalUsable * 0.9);
+  await push('泥瓦工程', '厨卫墙地面防水（聚合物水泥基三遍）', (kitchenArea + bathArea) * 1.75);
+  await push('泥瓦工程', '闭水试验', 1);
+  await push('泥瓦工程', '墙砖薄贴（300×600）', kitchenArea * 2.2 + bathArea * 3.4);
+  await push('泥瓦工程', '地砖薄贴（800×800）', totalUsable * 0.78);
+  await push('泥瓦工程', '瓷砖美缝', (kitchenArea * 2.2 + bathArea * 3.4 + totalUsable * 0.78) * 0.85);
+  await push('泥瓦工程', '踢脚线安装（瓷砖/石材）', totalUsable * 0.32);
+  await push('泥瓦工程', '门槛石/窗台石安装', Math.max(4, Object.keys(spaceMap).length * 0.9));
+  await push('泥瓦工程', '厨卫包立管', Math.max(1, Math.round((kitchenArea + bathArea) / 12)));
+  await push('泥瓦工程', '墙面拉毛处理', kitchenArea * 2.2 + bathArea * 3.4);
+  await push('泥瓦工程', '墙面界面剂（墙固）', totalUsable * 2.4);
 
   /* --- 4. 木作吊顶 --- */
   const ceilArea = totalUsable * (tier === '简装' ? 0.12 : tier === '中档' ? 0.22 : 0.34);
   if (ceilArea > 3) {
-    push('木作吊顶', '轻钢龙骨石膏板平吊顶', ceilArea * 0.7);
-    push('木作吊顶', '局部吊顶（边顶/灯槽）', totalUsable * 0.28);
+    await push('木作吊顶', '轻钢龙骨石膏板平吊顶', ceilArea * 0.7);
+    await push('木作吊顶', '局部吊顶（边顶/灯槽）', totalUsable * 0.28);
   }
-  push('木作吊顶', '铝扣板吊顶（厨卫）', kitchenArea + bathArea);
-  push('木作吊顶', '石膏线安装', totalUsable * 0.42);
-  push('木作吊顶', '木作窗帘盒', Object.keys(spaceMap).filter((n) => !n.includes('卫') && !n.includes('厨')).length * 3.2);
+  await push('木作吊顶', '铝扣板吊顶（厨卫）', kitchenArea + bathArea);
+  await push('木作吊顶', '石膏线安装', totalUsable * 0.42);
+  await push('木作吊顶', '木作窗帘盒', Object.keys(spaceMap).filter((n) => !n.includes('卫') && !n.includes('厨')).length * 3.2);
   if (tier === '高档' || tier === '定制') {
-    push('木作吊顶', '电视背景墙基层', 8);
+    await push('木作吊顶', '电视背景墙基层', 8);
   }
 
   /* --- 5. 油漆涂装 --- */
   const wallArea = totalUsable * 2.5;
-  push('油漆涂装', '墙面基层修补', wallArea * 0.35);
-  push('油漆涂装', '墙面挂网（防裂）', wallArea * (isOld ? 1 : 0.35));
-  push('油漆涂装', '腻子批刮（三遍）', wallArea);
-  push('油漆涂装', '墙面打磨', wallArea);
-  push('油漆涂装', '墙面刷乳胶漆（底漆一遍+面漆两遍）', wallArea * 0.82);
-  push('油漆涂装', '顶面刷乳胶漆', totalUsable * 0.9);
-  push('油漆涂装', '乳胶漆调色（每色）', tier === '简装' ? 0 : 1);
-  push('油漆涂装', '石膏线刷漆', totalUsable * 0.42);
+  await push('油漆涂装', '墙面基层修补', wallArea * 0.35);
+  await push('油漆涂装', '墙面挂网（防裂）', wallArea * (isOld ? 1 : 0.35));
+  await push('油漆涂装', '腻子批刮（三遍）', wallArea);
+  await push('油漆涂装', '墙面打磨', wallArea);
+  await push('油漆涂装', '墙面刷乳胶漆（底漆一遍+面漆两遍）', wallArea * 0.82);
+  await push('油漆涂装', '顶面刷乳胶漆', totalUsable * 0.9);
+  await push('油漆涂装', '乳胶漆调色（每色）', tier === '简装' ? 0 : 1);
+  await push('油漆涂装', '石膏线刷漆', totalUsable * 0.42);
 
   /* --- 6. 安装五金 --- */
-  push('安装五金', '筒灯/射灯安装', Math.round(area * 0.28));
-  push('安装五金', '主灯安装', Math.max(3, Object.keys(spaceMap).length - 2));
-  push('安装五金', '开关插座面板安装', Math.round(area * 0.45));
-  push('安装五金', '木地板安装', totalUsable * (tier === '简装' ? 0.45 : 0.62));
-  push('安装五金', '室内门安装', Math.max(2, Object.keys(spaceMap).filter((n) => n.includes('卧') || n.includes('书房')).length + 1));
-  push('安装五金', '窗台石英石安装', Math.max(3, Object.keys(spaceMap).length * 0.7));
-  push('安装五金', '马桶安装', layout.includes('两卫') ? 2 : 1);
-  push('安装五金', '浴室柜/台盆安装', layout.includes('两卫') ? 2 : 1);
-  push('安装五金', '淋浴花洒安装', layout.includes('两卫') ? 2 : 1);
-  push('安装五金', '窗帘杆/轨道安装', Math.max(4, Object.keys(spaceMap).length * 2.4));
-  push('安装五金', '晾衣架安装', 1);
-  push('安装五金', '毛巾架/五金挂件安装', layout.includes('两卫') ? 6 : 4);
+  await push('安装五金', '筒灯/射灯安装', Math.round(area * 0.28));
+  await push('安装五金', '主灯安装', Math.max(3, Object.keys(spaceMap).length - 2));
+  await push('安装五金', '开关插座面板安装', Math.round(area * 0.45));
+  await push('安装五金', '木地板安装', totalUsable * (tier === '简装' ? 0.45 : 0.62));
+  await push('安装五金', '室内门安装', Math.max(2, Object.keys(spaceMap).filter((n) => n.includes('卧') || n.includes('书房')).length + 1));
+  await push('安装五金', '窗台石英石安装', Math.max(3, Object.keys(spaceMap).length * 0.7));
+  await push('安装五金', '马桶安装', layout.includes('两卫') ? 2 : 1);
+  await push('安装五金', '浴室柜/台盆安装', layout.includes('两卫') ? 2 : 1);
+  await push('安装五金', '淋浴花洒安装', layout.includes('两卫') ? 2 : 1);
+  await push('安装五金', '窗帘杆/轨道安装', Math.max(4, Object.keys(spaceMap).length * 2.4));
+  await push('安装五金', '晾衣架安装', 1);
+  await push('安装五金', '毛巾架/五金挂件安装', layout.includes('两卫') ? 6 : 4);
 
   /* --- 7. 定制主材（中高档才含） --- */
   if (pkg && (pkg.code === 'hardcover-all' || tier === '高档' || tier === '定制')) {
-    push('定制主材', '橱柜地柜（含台面）', Math.max(2.5, kitchenArea * 0.55));
-    push('定制主材', '橱柜吊柜', Math.max(1.8, kitchenArea * 0.4));
-    push('定制主材', '衣柜柜体（投影面积）', Math.max(4, totalUsable * 0.075));
-    push('定制主材', '玄关柜/鞋柜', 1.6);
+    await push('定制主材', '橱柜地柜（含台面）', Math.max(2.5, kitchenArea * 0.55));
+    await push('定制主材', '橱柜吊柜', Math.max(1.8, kitchenArea * 0.4));
+    await push('定制主材', '衣柜柜体（投影面积）', Math.max(4, totalUsable * 0.075));
+    await push('定制主材', '玄关柜/鞋柜', 1.6);
   }
 
   /* --- 8. 措施与其他 --- */
-  push('措施与其他', '施工管理费', area);
-  push('措施与其他', '竣工开荒保洁', totalUsable);
-  push('措施与其他', '材料运输费', 1);
-  push('措施与其他', '施工水电费', 1);
-  if (!isOld) push('措施与其他', '成品保护费', 1);
+  await push('措施与其他', '施工管理费', area);
+  await push('措施与其他', '竣工开荒保洁', totalUsable);
+  await push('措施与其他', '材料运输费', 1);
+  await push('措施与其他', '施工水电费', 1);
+  if (!isOld) await push('措施与其他', '成品保护费', 1);
 
   /* --- 假设说明 --- */
   assumptions.push(`按建筑面积 ${area} m²、得房系数 ${(usableRatio(building_type) * 100).toFixed(0)}% 推算套内面积约 ${totalUsable.toFixed(1)} m²`);
@@ -370,8 +374,8 @@ function guessLayout(layout) {
 }
 
 /** 完整估算主入口 */
-function estimate(p) {
-  const { items, assumptions } = generateQuoteItems(p);
+async function estimate(p) {
+  const { items, assumptions } = await generateQuoteItems(p);
   const total = Math.round(items.reduce((s, i) => s + i.amount, 0) * 100) / 100;
   const cost = Math.round(items.reduce((s, i) => s + i.cost_price * i.qty, 0) * 100) / 100;
   const area = Number(p.building_area) || 100;
@@ -418,7 +422,7 @@ const FEATURES = {
   /** 智能估算：生成报价草稿 */
   'smart-estimate': async (p) => {
     const pkg = p.package_code ? PACKAGES.find((x) => x.code === p.package_code) : null;
-    const res = estimate({ ...p, pkg });
+    const res = await estimate({ ...p, pkg });
     return {
       ...res,
       summary: `按 ${p.city || '当地'} ${p.building_area}m² ${p.layout || ''} ${p.tier || '中档'} 口径，综合空间清单与工艺库生成，共 ${res.items.length} 条明细。`,
@@ -428,7 +432,7 @@ const FEATURES = {
   'full-estimate': async (p) => FEATURES['smart-estimate'](p),
 
   'estimate-cost': async (p) => {
-    const res = estimate(p);
+    const res = await estimate(p);
     return {
       total: res.total,
       per_sqm: res.per_sqm,
@@ -560,7 +564,7 @@ const FEATURES = {
     const text = String(p.text || '');
     const city = p.city;
     const cf = cityFactor(city);
-    const all = db.library.all();
+    const all = await db.library.all();
     const items = [];
 
     // 1) 直接命中工艺库关键词
@@ -594,8 +598,8 @@ const FEATURES = {
   /** 单点价格建议 */
   'price-suggestion': async (p) => {
     const cf = cityFactor(p.city);
-    const lib = db.library.findOne((x) => x.name === p.item_name) ||
-      db.library.findOne((x) => (x.tags || []).some((t) => String(p.item_name || '').includes(t)));
+    const lib = await db.library.findOne((x) => x.name === p.item_name) ||
+      await db.library.findOne((x) => (x.tags || []).some((t) => String(p.item_name || '').includes(t)));
     const base = lib ? lib.price : Number(p.current_price) || 50;
     return {
       item_name: p.item_name,
@@ -616,10 +620,11 @@ const FEATURES = {
   /** 相似项推荐 */
   'item-suggestion': async (p) => {
     const name = String(p.item_name || '');
-    const lib = db.library.findOne((x) => x.name === name);
+    const lib = await db.library.findOne((x) => x.name === name);
     if (!lib) return { suggestions: [] };
     const cf = cityFactor(p.city);
-    const sug = db.library
+    const allItems = await db.library.all();
+    const sug = allItems
       .filter((x) => x.group_key === lib.group_key && x.id !== lib.id)
       .map((x) => ({ ...x, score: similarity(name, x.name) }))
       .sort((a, b) => b.score - a.score)
@@ -643,15 +648,19 @@ const FEATURES = {
     if (!items.some((i) => /闭水|试压/.test(i.name || ''))) missing.push({ type: '缺验收项', detail: '未发现闭水试验 / 打压试验' });
     if (!items.some((i) => /保护|清运|保洁/.test(i.name || ''))) missing.push({ type: '缺措施费', detail: '未发现成品保护 / 垃圾清运 / 保洁' });
 
+    const allLibs = await db.library.all();
+    const libMap = {};
+    for (const lib of allLibs) libMap[lib.name] = lib;
+
     const anomalies = items
       .filter((i) => {
-        const lib = db.library.findOne((x) => x.name === i.name);
+        const lib = libMap[i.name];
         if (!lib) return false;
         const price = Number(i.unit_price) || 0;
         return price > lib.price * 1.35 || price < lib.price * 0.62;
       })
       .map((i) => {
-        const lib = db.library.findOne((x) => x.name === i.name);
+        const lib = libMap[i.name];
         return { name: i.name, current: i.unit_price, reference: lib.price, level: (Number(i.unit_price) || 0) > lib.price * 1.35 ? 'high' : 'low' };
       });
 
@@ -747,7 +756,7 @@ const FEATURES = {
 
   /** 价格库体检：按「同分类 + 同单位」比较，避免跨量级误报 */
   'price-library-audit': async (p) => {
-    const items = scopeItems(p.org_id);
+    const items = await scopeItems(p.org_id);
     const issues = [];
 
     // 1) 离群价：只在同分类且同单位的组内比较，且组内至少 5 条才判定
@@ -800,7 +809,7 @@ const FEATURES = {
     const target = p.target_city || '';
     const factor = cityFactor(target);
     const tierName = cityTierName(target);
-    const items = scopeItems(p.org_id);
+    const items = await scopeItems(p.org_id);
     const sample = items.slice(0, 60).map((x) => ({
       name: x.name,
       unit: x.unit,
@@ -822,13 +831,16 @@ const FEATURES = {
 
   /** 审计异常预警 */
   'audit-risk': async (p) => {
-    const logs = db.ai_logs.all().slice(-500);
+    const logs = (await db.ai_logs.all()).slice(-500);
     const byUser = {};
     logs.forEach((l) => { byUser[l.user_id] = (byUser[l.user_id] || 0) + 1; });
     const alerts = [];
+    const allUsers = await db.users.all();
+    const userMap = {};
+    allUsers.forEach((u) => { userMap[u.id] = u; });
     Object.entries(byUser).forEach(([uid, count]) => {
       if (count > 60) {
-        const u = db.users.findOne({ id: uid });
+        const u = userMap[uid];
         alerts.push({ level: '中', type: '高频调用', user: u ? u.name || u.phone : uid, count, advice: '确认是否为批量测试或接口抓取' });
       }
     });
@@ -967,5 +979,6 @@ function costOf(feature) { return FEATURE_COSTS[feature] ?? 5; }
 module.exports = {
   run, costOf, FEATURES, FEATURE_COSTS, PACKAGES, TIERS, LAYOUTS, CITY_TIERS,
   cityFactor, cityTierName, breakdownRooms, estimate, generateQuoteItems, spaceType,
+  libItem, libPrice, libCost, libUnit, scopeItems,
   provider,
 };
