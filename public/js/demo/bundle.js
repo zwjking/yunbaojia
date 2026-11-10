@@ -373,77 +373,30 @@ __define('@http', function () {
 /* ================= demo/db.browser.js → 替换 server/lib/db.js ================= */
 __define("server/lib/db.js", function (module, exports, require, __dirname, __filename) {
 /* ============================================================================
- * 浏览器端数据层（资料库 Database 持久化 + localStorage 兜底）
+ * 浏览器端数据层（构建时以 server/lib/db.js 的身份注册）
  *
  * 对外 API 与服务端 lib/db.js 完全一致（all/find/findOne/insert/insertMany/
- * update/remove/removeWhere/count/nextSeq），上层路由与 AI 引擎无需任何改动。
- *
- * 持久化策略：
- *   - 有 window.__SMART_PAGE__.database（资料库发布态）→ 读写在资料库结构化数据表
- *   - 不可用（本地 file:// / 普通静态托管）→ 退化为 localStorage，并内置演示种子
- * 字段映射：每个集合的字段类型在此声明，写入时按类型包装成 PropertyValue。
+ * update/remove/removeWhere/count/nextSeq），因此上层路由与 AI 引擎无需任何改动。
+ * 区别只在存储介质：Node 写 data/*.json → 浏览器写 localStorage。
  * ========================================================================== */
 
-/* 【坑】表 id 缺失时该集合会静默退化为 localStorage（不报错）→ 新增表必须同时补这里 */
-const DB_IDS = {"users":"AUkb8i7e6iepxWPy6MTJA1","orgs":"RrjZUyTfN8A3HnHhojRKkN","quotes":"3YixzVqRnu3JZUb9gtYqnY","quote_items":"UDOAqSMrnFiOmrvA66wUNc","customers":"vwr5xVlAXAhzyXil5x6Isn","templates":"0SjLcn85g9hbZXPihdSoDr","library":"oaqhJHRs5MYlVBeZsNJ5Bq","credits":"Fdm1HhENJgEh8SNV0fUADB","orders":"NZLYr3F3mxOo9UvpUcpefx"};
+const __DB_PREFIX = 'hq_demo_v1:';
+const __DB_SCHEMA = '1';
+const __PERSIST_MAX = 900 * 1024; // 单集合持久化上限，超出则裁剪历史日志
 
-/* 各集合字段类型（与资料库表结构一一对应）
- * 【坑】此处未声明的字段会在写库时被 docToProperties 静默丢弃 →
- *       表现为「页面上改了、刷新就还原」，且完全没有报错。新增字段必须同步补这里。 */
-const FIELD_TYPES = {
-  users: { id:'text', phone:'phone_number', email:'text', password_hash:'text', name:'text', org_id:'text', plan:'select', role:'select', status:'select', credits:'number', credits_month:'text', export_used:'number', export_purchased:'number', is_platform_admin:'checkbox', permissions:'json', plan_expires_at:'text', last_login_at:'text', created_at:'text', updated_at:'text' },
-  orgs: { id:'text', name:'text', plan:'select', settings:'json', status:'select', created_at:'text', updated_at:'text' },
-  orders: { id:'text', org_id:'text', user_id:'text', kind:'select', order_no:'text', plan:'text', plan_name:'text', cycle:'select', pack_code:'text', pack_name:'text', call_count:'number', amount:'number', status:'select', paid_at:'text', pay_method:'text', refunded_at:'text', invoice_requested:'checkbox', invoice_status:'select', invoice_title:'text', invoice_tax_no:'text', created_at:'text', updated_at:'text' },
-  quotes: { id:'text', org_id:'text', user_id:'text', quote_number:'text', title:'text', customer_id:'text', customer_name:'text', customer_phone:'phone_number', community:'text', city:'text', province:'text', building_area:'number', layout:'text', tier:'select', house_type:'select', house_age:'number', floor:'number', building_type:'text', status:'select', total_amount:'number', cost_amount:'number', margin_rate:'number', item_count:'number', notes:'text', items:'json', created_at:'text', updated_at:'text' },
-  quote_items: { id:'text', org_id:'text', quote_id:'text', room:'text', name:'text', category:'text', quantity:'number', unit:'text', unit_price:'number', amount:'number', note:'text', created_at:'text', updated_at:'text' },
-  customers: { id:'text', org_id:'text', name:'text', phone:'phone_number', community:'text', building_area:'number', layout:'text', source:'text', status:'select', created_at:'text', updated_at:'text' },
-  templates: { id:'text', org_id:'text', user_id:'text', name:'text', layout:'text', building_area:'number', tier:'select', note:'text', spaces:'json', building_type:'text', house_type:'text', city:'text', source:'text', created_at:'text', updated_at:'text' },
-  library: { id:'text', org_id:'text', group_key:'text', group_name:'text', category:'text', subcategory:'text', name:'text', unit:'text', unit_price:'number', spec:'text', note:'text', source:'text', created_at:'text', updated_at:'text' },
-  credits: { id:'text', org_id:'text', user_id:'text', amount:'number', reason:'text', type:'select', created_at:'text', updated_at:'text' },
-};
-
-/* 入库时不同步的集合（体量大 / 只读基础库），始终走 localStorage */
-const LOCAL_ONLY = { library: true };
-
-const __DB_PREFIX = 'hq_web_v1:';
-const __DB_SCHEMA = '3';
-const __PERSIST_MAX = 900 * 1024;
-
-function uid() {
-  return (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)).toUpperCase();
-}
-function now() { return new Date().toISOString(); }
-
-/** 获取 database SDK（平台注入，可能尚未就绪） */
-function sdk() {
-  return (typeof window !== 'undefined' && window.__SMART_PAGE__ && window.__SMART_PAGE__.database) || null;
-}
-
-/**
- * 等待资料库 SDK 注入就绪（平台在 page 加载后才异步注入
- * window.__SMART_PAGE__.database）。若首屏即发生写操作，sdk() 可能暂为 null；
- * 若不等待直接写库，记录会静默丢失（仅存内存）。这里轮询等待其就绪。
- */
-async function waitSdk(timeoutMs) {
-  if (typeof window === 'undefined') return null;
-  const start = Date.now();
-  // 超时可通过 window.__HQ_SDK_TIMEOUT_MS 覆盖（自测/低延迟场景用）
-  const limit = timeoutMs || window.__HQ_SDK_TIMEOUT_MS || 10000;
-  let db = sdk();
-  while (!db && Date.now() - start < limit) {
-    await new Promise((r) => setTimeout(r, 150));
-    db = sdk();
-  }
-  return db;
-}
-
-/** localStorage 探测 */
 function __storage() {
-  try { localStorage.setItem('__hq_probe', '1'); localStorage.removeItem('__hq_probe'); return localStorage; }
-  catch (e) { return null; }
+  try {
+    localStorage.setItem('__hq_probe', '1');
+    localStorage.removeItem('__hq_probe');
+    return localStorage;
+  } catch (e) {
+    return null; // 隐私模式等场景：退化为纯内存，功能仍可用
+  }
 }
+
 const __ls = __storage();
 const __memory = {};
+
 function __readRaw(key) {
   if (!__ls) return __memory[key] === undefined ? null : __memory[key];
   return __ls.getItem(key);
@@ -457,246 +410,42 @@ function __removeRaw(key) {
   __ls.removeItem(key);
 }
 
-/** 单个值 → PropertyValue（SDK 要求 { <类型>: 值 } 包装） */
-function toPV(type, val) {
-  if (val === undefined) return null;
-  if (type === 'json') {
-    if (val === null) return { text: 'null' };
-    try { return { text: typeof val === 'string' ? val : JSON.stringify(val) }; }
-    catch (e) { return { text: 'null' }; }
-  }
-  if (val === null || val === '') return null;
-  switch (type) {
-    case 'number': return { number: Number(val) || 0 };
-    case 'checkbox': return { checkbox: !!val };
-    case 'select': return { select: String(val) };
-    case 'phone_number': return { phone_number: String(val) };
-    case 'date': return { date: String(val) };
-    default: return { text: String(val) };
-  }
-}
-
-/** 业务对象 → properties（只保留表里声明过的字段）
- *
- * 【注意】未在 FIELD_TYPES 声明的字段会被丢弃 —— 这是「页面改了、刷新还原」的常见成因，
- * 因此这里会留一条 drop 记录（同名字段只记一次，避免刷屏）。
- */
-const __DROPPED_FIELD_SEEN = {};
-function docToProperties(coll, doc) {
-  const types = FIELD_TYPES[coll] || {};
-  const props = {};
-  Object.keys(doc).forEach(function (k) {
-    if (k === '__rid') return;
-    const t = types[k];
-    if (!t) {
-      const sig = coll + '.' + k;
-      if (!__DROPPED_FIELD_SEEN[sig]) {
-        __DROPPED_FIELD_SEEN[sig] = 1;
-        noteWriteFail('drop', coll, '字段未在 FIELD_TYPES 声明，写入时被丢弃: ' + k);
-      }
-      return;
-    }
-    const pv = toPV(t, doc[k]);
-    if (pv !== null) props[k] = pv;
-  });
-  return props;
-}
-
-/** 数据库记录（扁平）→ 业务对象（含 __rid 主键） */
-function recordToDoc(coll, rec) {
-  const types = FIELD_TYPES[coll] || {};
-  const doc = {};
-  Object.keys(rec).forEach(function (k) {
-    if (k === '_id') return;
-    const t = types[k];
-    let v = rec[k];
-    if (typeof v === 'object' && v !== null && !Array.isArray(v)) {
-      // SDK 可能回传 { text: '...' } 包装；解包
-      const keys = Object.keys(v);
-      if (keys.length === 1 && ['text','number','select','multi_select','date','checkbox','url','email','phone_number','image'].indexOf(keys[0]) >= 0) {
-        v = v[keys[0]];
-      }
-    }
-    if (t === 'json') {
-      if (typeof v === 'string') { try { doc[k] = JSON.parse(v); } catch (e) { doc[k] = v; } }
-      else doc[k] = v === null || v === undefined ? null : v;
-    } else {
-      doc[k] = v === '' ? '' : v;
-    }
-  });
-  if (rec._id != null) doc.__rid = rec._id;
-  return doc;
-}
-
-/** 从 DB 加载全量数据（分页），保留记录主键 __rid */
-async function loadAll(db, dbId, coll) {
-  const all = [];
-  let cursor = undefined;
-  for (let guard = 0; guard < 100; guard++) {
-    const r = await db.query({ databaseId: dbId, pageSize: 200, startCursor: cursor });
-    all.push(...(r.results || []));
-    if (!r.hasMore || !r.nextCursor || r.nextCursor === cursor) break;
-    cursor = r.nextCursor;
-  }
-  return all.map(function (item) { return recordToDoc(coll, item); });
-}
-
-/* ============================================================================
- * 写入失败记录（诊断用）
- *
- * 【为什么要这个】原实现里所有写库失败都是静默的：
- *   - SDK 未就绪 → return
- *   - 记录主键 __rid 缺失 → 整条跳过
- *   - 底层抛错 → 只 console.error
- * 于是「数据库根本没写进去」在界面上与「写成功了」完全一样，
- * 只能靠去平台后台逐条比对记录时间戳才能发现。
- * 现在任何一次写失败都会计数并留下最后一条原因，可通过 getWriteFailures() 读取。
- * ========================================================================== */
-const __WRITE_FAILS = { insert: 0, update: 0, remove: 0, resolve: 0, last: null, log: [] };
-function noteWriteFail(kind, coll, detail) {
-  __WRITE_FAILS[kind] = (__WRITE_FAILS[kind] || 0) + 1;
-  const msg = kind + ' | ' + coll + ' | ' + (detail || 'unknown');
-  __WRITE_FAILS.last = msg;
-  if (__WRITE_FAILS.log.length < 40) __WRITE_FAILS.log.push(msg);
-  try { console.warn('[db-adapter] WRITE FAILED: ' + msg); } catch (e) { /* noop */ }
-}
-function getWriteFailures() { return { insert: __WRITE_FAILS.insert, update: __WRITE_FAILS.update, remove: __WRITE_FAILS.remove, resolve: __WRITE_FAILS.resolve, drop: __WRITE_FAILS.drop || 0, last: __WRITE_FAILS.last, log: __WRITE_FAILS.log.slice() }; }
-
-/** 从 SDK 返回的记录里取主键（平台用 _id；兼容 id / recordId / record_id） */
-function pickRid(r) {
-  if (!r) return null;
-  return r._id || r.id || r.recordId || r.record_id || null;
-}
-
-/** 单条写入 DB */
-async function dbInsert(db, dbId, coll, doc) {
-  if (!db) { noteWriteFail('insert', coll, 'sdk-not-ready'); return null; }
-  if (!dbId) { noteWriteFail('insert', coll, 'no-database-id'); return null; }
-  try {
-    const r = await db.addRecord({ databaseId: dbId, properties: docToProperties(coll, doc) });
-    const rid = pickRid(r);
-    if (!rid) noteWriteFail('insert', coll, 'response-has-no-record-id');
-    return rid;
-  } catch (e) { noteWriteFail('insert', coll, e && e.message); return null; }
-}
-
-/** 单条更新 DB（增量） */
-async function dbUpdate(db, dbId, coll, recordId, patch) {
-  if (!db) { noteWriteFail('update', coll, 'sdk-not-ready'); return false; }
-  if (!recordId) { noteWriteFail('update', coll, 'no-record-id'); return false; }
-  const props = docToProperties(coll, patch);
-  if (!Object.keys(props).length) { noteWriteFail('update', coll, 'empty-properties(字段未在 FIELD_TYPES 声明)'); return false; }
-  try {
-    await db.updateRecord({ databaseId: dbId, recordId: recordId, properties: props });
-    return true;
-  } catch (e) { noteWriteFail('update', coll, e && e.message); return false; }
-}
-
-/** 单条删除 DB */
-async function dbDelete(db, dbId, recordId) {
-  if (!db || !recordId) return false;
-  try { await db.deleteRecord({ databaseId: dbId, recordId: recordId }); return true; }
-  catch (e) { noteWriteFail('remove', recordId, e && e.message); return false; }
-}
-
-/**
- * 记录主键缺失时，按业务 id 回平台反查 __rid（自愈）。
- *
- * 【为什么需要】__rid 只在两个时机拿到：loadFromDb 读库时、insert 成功时。
- * 若某条记录是在「SDK 尚未注入」的首屏被插入的，或 addRecord 返回体没带主键，
- * 它就会以 __rid=null 常驻内存 —— 此后所有 update 全部静默跳过（记录看起来永远改不动）。
- * 这里在写之前补一次反查，把这类脏记录救回来。
- */
-async function resolveRid(db, dbId, coll, doc) {
-  if (!db || !dbId || !doc || doc.id == null) return null;
-  try {
-    const r = await db.query({ databaseId: dbId, pageSize: 200 });
-    const hit = (r.results || []).find(function (rec) {
-      const flat = (rec && rec.properties) ? rec.properties : rec;
-      if (!flat) return false;
-      let v = flat.id;
-      if (v && typeof v === 'object') v = v.text !== undefined ? v.text : v.number;
-      return String(v) === String(doc.id);
-    });
-    const rid = pickRid(hit);
-    if (rid) doc.__rid = rid;
-    else noteWriteFail('resolve', coll, 'record-not-found-on-platform:id=' + doc.id);
-    return rid || null;
-  } catch (e) { noteWriteFail('resolve', coll, e && e.message); return null; }
-}
-
-/** 取记录主键：优先内存中的 __rid，缺失则回平台反查一次并回填 */
-async function ensureRid(db, dbId, coll, doc) {
-  if (doc.__rid) return doc.__rid;
-  return resolveRid(db, dbId, coll, doc);
-}
-
 class Collection {
   constructor(name, seedFn) {
     this.name = name;
-    this.dbId = LOCAL_ONLY[name] ? null : (DB_IDS[name] || null);
     this.key = __DB_PREFIX + name;
     this.dirty = false;
     this.timer = null;
-    this._seedFn = seedFn || null;
-    this._loaded = false;
-    this._writes = [];
-
-    // 先用 localStorage（同步可用），随后由 loadFromDb() 用数据库数据覆盖
     const raw = __readRaw(this.key);
     if (raw) {
-      try { this.items = JSON.parse(raw); } catch (e) { this.items = seedFn ? seedFn() : []; }
+      try {
+        this.items = JSON.parse(raw);
+      } catch (e) {
+        console.warn(`[demo-db] ${name} 解析失败，已重建`, e.message);
+        this.items = seedFn ? seedFn() : [];
+        this.flush();
+      }
     } else {
       this.items = seedFn ? seedFn() : [];
+      this.flush();
     }
   }
-
-  /** 从数据库加载（由 readyAll 统一触发；显式等待 SDK 注入就绪，避免首屏 sdk() 为 null 时静默跳过） */
-  async loadFromDb() {
-    if (this._loaded) return;
-    const db = await waitSdk();
-    if (!this.dbId || !db) {
-      if (this.dbId && !db) noteWriteFail('load', this.name, 'sdk-unavailable → 该集合本次会话走本地缓存');
-      this._loaded = true;
-      return;
-    }
-    try {
-      const data = await loadAll(db, this.dbId, this.name);
-      if (data && data.length > 0) {
-        this.items = data;
-        __writeRaw(this.key, JSON.stringify(this.items));
-      } else if (data && data.length === 0 && this._seedFn) {
-        // 数据库为空 → 用种子数据初始化并写入
-        const seedItems = this._seedFn();
-        this.items = seedItems;
-        __writeRaw(this.key, JSON.stringify(this.items));
-        for (const item of seedItems) {
-          const rid = await dbInsert(db, this.dbId, this.name, item);
-          if (rid) item.__rid = rid;
-          else await resolveRid(db, this.dbId, this.name, item);
-        }
-        __writeRaw(this.key, JSON.stringify(this.items));
-      }
-    } catch (e) {
-      console.error('[db-adapter] load failed', this.name, e && e.message);
-    } finally {
-      this._loaded = true;
-    }
-  }
-
-  _db() { return sdk(); }
 
   flush() {
     let payload = JSON.stringify(this.items);
+    // 超出上限时裁剪最旧记录（仅日志类集合会触发）
     if (payload.length > __PERSIST_MAX && this.items.length > 50) {
       this.items = this.items.slice(-50);
       payload = JSON.stringify(this.items);
     }
     const okWrite = __writeRaw(this.key, payload);
-    if (!okWrite) console.warn('[db-adapter] ' + this.name + ' 写入失败');
+    if (!okWrite) {
+      console.warn(`[demo-db] ${this.name} 写入失败（可能存储已满），本次仅保留在内存中`);
+    }
     this.dirty = false;
   }
 
+  /** 延迟合并写入：种子数据批量插入时只落盘一次 */
   save() {
     this.dirty = true;
     if (this.timer) return;
@@ -724,24 +473,8 @@ class Collection {
     doc.updated_at = now();
     this.items.push(doc);
     this.save();
-    if (this.dbId) {
-      const self = this;
-      this._track((async () => {
-        const db = await waitSdk();
-        if (!db) { noteWriteFail('insert', self.name, 'sdk-unavailable'); return; }
-        const rid = await dbInsert(db, self.dbId, self.name, doc);
-        if (rid) doc.__rid = rid;
-        else await resolveRid(db, self.dbId, self.name, doc);   // 返回体没带主键 → 反查回填，避免此后再也改不动
-      })());
-    }
     return doc;
   }
-
-  /** 记录后台写入，供 pending() 等待 */
-  _track(p) { this._writes.push(p); return p; }
-
-  /** 等待本集合全部待写入完成 */
-  pending() { return Promise.all(this._writes.splice(0)); }
 
   insertMany(docs) {
     docs.forEach((d) => {
@@ -750,103 +483,49 @@ class Collection {
     });
     this.items.push(...docs);
     this.save();
-    if (this.dbId) {
-      // 分批并发写入（每批 8 条），缩短大批量落库时间
-      const self = this;
-      const job = (async function () {
-        const db = await waitSdk();
-        if (!db) { noteWriteFail('insert', self.name, 'sdk-unavailable(batch)'); return; }
-        const BATCH = 8;
-        for (let i = 0; i < docs.length; i += BATCH) {
-          const slice = docs.slice(i, i + BATCH);
-          const rids = await Promise.all(slice.map((d) => dbInsert(db, self.dbId, self.name, d)));
-          for (let k = 0; k < slice.length; k++) {
-            if (rids[k]) slice[k].__rid = rids[k];
-            else await resolveRid(db, self.dbId, self.name, slice[k]);
-          }
-        }
-        __writeRaw(self.key, JSON.stringify(self.items));
-      })();
-      this._track(job);
-    }
     return docs;
   }
 
   update(id, patch) {
     const idx = this.items.findIndex((it) => it.id === id);
-    if (idx === -1) { noteWriteFail('update', this.name, 'local-record-not-found:id=' + id); return null; }
-    const prev = this.items[idx];
-    const merged = { ...prev, ...patch, updated_at: now() };
-    this.items[idx] = merged;
+    if (idx === -1) return null;
+    this.items[idx] = { ...this.items[idx], ...patch, updated_at: now() };
     this.save();
-    if (this.dbId) {
-      const self = this;
-      this._track((async () => {
-        const db = await waitSdk();
-        if (!db) { noteWriteFail('update', self.name, 'sdk-unavailable'); return; }
-        // __rid 缺失（首屏 SDK 未就绪时写入 / insert 返回体无主键）→ 先回平台反查，
-        // 否则这次 update 会被静默丢弃（历史 bug：账号套餐改了但库里没变）
-        const rid = await ensureRid(db, self.dbId, self.name, merged);
-        if (!rid) return;
-        // 回填到集合内的当前记录：自愈只需一次，之后不再走反查
-        const cur = self.items.find((it) => it.id === id);
-        if (cur) cur.__rid = rid;
-        // updated_at 必须随 patch 一起写库；原实现只写增量字段，
-        // 结果线上所有记录的 updated_at 永远停在 created_at
-        await dbUpdate(db, self.dbId, self.name, rid, { ...patch, updated_at: merged.updated_at });
-      })());
-    }
-    return merged;
+    return this.items[idx];
   }
 
   remove(id) {
     const idx = this.items.findIndex((it) => it.id === id);
     if (idx === -1) return false;
-    const removed = this.items[idx];
     this.items.splice(idx, 1);
     this.save();
-    if (this.dbId) {
-      const self = this;
-      this._track((async () => {
-        const db = await waitSdk();
-        if (!db) { noteWriteFail('remove', self.name, 'sdk-unavailable'); return; }
-        const rid = await ensureRid(db, self.dbId, self.name, removed);
-        if (!rid) return;
-        await dbDelete(db, self.dbId, rid);
-      })());
-    }
     return true;
   }
 
   removeWhere(pred) {
     const before = this.items.length;
-    const toRemove = this.items.filter(pred);
     this.items = this.items.filter((it) => !pred(it));
     if (this.items.length !== before) this.save();
-    if (this.dbId) {
-      const self = this;
-      toRemove.forEach((it) => this._track((async () => {
-        const db = await waitSdk();
-        if (!db) { noteWriteFail('remove', self.name, 'sdk-unavailable(where)'); return; }
-        const rid = await ensureRid(db, self.dbId, self.name, it);
-        if (!rid) return;
-        await dbDelete(db, self.dbId, rid);
-      })()));
-    }
     return before - this.items.length;
   }
 
   count(pred) { return pred ? this.find(pred).length : this.items.length; }
 
   nextSeq(key, start = 1) {
-    const meta = this.findOne({ id: 'seq' }) || this.insert({ id: 'seq', data: {} });
+    const meta = db.meta.findOne({ id: 'seq' }) || db.meta.insert({ id: 'seq', data: {} });
     const cur = (meta.data && meta.data[key]) || start - 1;
     const next = cur + 1;
     meta.data[key] = next;
-    this.update('seq', { data: meta.data });
+    db.meta.update('seq', { data: meta.data });
     return next;
   }
 }
+
+function uid() {
+  return (Date.now().toString(36) + Math.random().toString(36).slice(2, 8)).toUpperCase();
+}
+
+function now() { return new Date().toISOString(); }
 
 const db = {
   users: new Collection('users'),
@@ -864,22 +543,15 @@ const db = {
   notifications: new Collection('notifications'),
 };
 
-/** 等待所有集合从数据库加载完成（供 bootstrap 使用） */
-function readyAll() {
-  return Promise.all(Object.values(db).map((c) => c.loadFromDb()));
-}
-
-/** 等待所有后台写入落库完成 */
-function pendingAll() {
-  return Promise.all(Object.values(db).map((c) => c.pending()));
-}
-
+/** 页面关闭前强制落盘，避免防抖窗口内数据丢失 */
 function flushAll() {
   Object.values(db).forEach((c) => { if (c.timer) { clearTimeout(c.timer); c.timer = null; } if (c.dirty) c.flush(); });
 }
 
+/** 清空全部演示数据（下次访问重新播种） */
 function resetAll() {
-  Object.keys(db).forEach((k) => { db[k].items = []; db[k].dirty = false; });
+  Object.keys(db).forEach((k) => __removeRaw(__DB_PREFIX + k));
+  __removeRaw(__DB_PREFIX + 'schema');
 }
 
 if (typeof addEventListener === 'function') {
@@ -887,9 +559,10 @@ if (typeof addEventListener === 'function') {
   addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll(); });
 }
 
-module.exports = { db, uid, now, DATA_DIR: 'database', flushAll, resetAll, readyAll, pendingAll, SCHEMA: __DB_SCHEMA, PREFIX: __DB_PREFIX, getWriteFailures, resolveRid, DB_IDS };
+module.exports = { db, uid, now, DATA_DIR: 'localStorage', flushAll, resetAll, SCHEMA: __DB_SCHEMA, PREFIX: __DB_PREFIX };
 });
 
+/* ================= server/lib/http.js ================= */
 __define("server/lib/http.js", function (module, exports, require, __dirname, __filename) {
 /**
  * 零依赖 HTTP 工具：路由表、请求体解析、JSON 响应、静态文件
@@ -977,6 +650,9 @@ function json(res, data, status = 200) {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
     'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   });
   res.end(body);
 }
@@ -1052,10 +728,35 @@ __define("server/lib/auth.js", function (module, exports, require, __dirname, __
  * 认证与授权：密码哈希 + JWT（HS256，零依赖手写）
  */
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { db, uid, now } = require('./db');
 const { fail } = require('./http');
 
-const SECRET = process.env.HQ_SECRET || 'homequote-cloud-dev-secret-2026';
+/**
+ * JWT 签名秘钥解析：
+ * 1) 显式设置 HQ_SECRET 时优先使用（生产环境推荐）；
+ * 2) 否则在持久卷（POCKETBAY_DATA_DIR，平台注入）下生成并持久化一个随机秘钥，
+ *    保证重启后秘钥稳定、已签发 token 仍有效；本地开发落到 server/data。
+ * 这样在未配置 HQ_SECRET 的托管环境也能正常启动。
+ */
+function resolveSecret() {
+  if (process.env.HQ_SECRET) return process.env.HQ_SECRET;
+  const dataDir = process.env.POCKETBAY_DATA_DIR
+    ? path.join(process.env.POCKETBAY_DATA_DIR, 'homequote')
+    : path.join(__dirname, '..', 'data');
+  try { fs.mkdirSync(dataDir, { recursive: true }); } catch (e) { /* ignore */ }
+  const secretFile = path.join(dataDir, '.hq_secret');
+  try {
+    if (fs.existsSync(secretFile)) return fs.readFileSync(secretFile, 'utf8').trim();
+    const s = crypto.randomBytes(32).toString('hex');
+    try { fs.writeFileSync(secretFile, s, { mode: 0o600 }); } catch (e) { /* ignore */ }
+    return s;
+  } catch (e) {
+    return 'hq-dev-secret-' + crypto.randomBytes(8).toString('hex');
+  }
+}
+const SECRET = resolveSecret();
 const TOKEN_TTL = 60 * 60 * 24 * 7;      // 7 天
 const REFRESH_TTL = 60 * 60 * 24 * 30;   // 30 天
 
@@ -1118,20 +819,20 @@ function issueTokens(user) {
 }
 
 /* ---------------- 中间件 ---------------- */
-function parseAuth(req) {
+async function parseAuth(req) {
   const raw = req.headers.authorization || req.headers.Authorization || '';
   const token = raw.startsWith('Bearer ') ? raw.slice(7) : (raw || '');
   if (!token) return null;
   const payload = verify(token);
   if (!payload || !payload.sub) return null;
-  const user = db.users.findOne({ id: payload.sub });
+  const user = await db.users.findOne({ id: payload.sub });
   if (!user) return null;
   if (user.status === 'disabled') return null;
   return user;
 }
 
-function requireAuth(req, res) {
-  const user = parseAuth(req);
+async function requireAuth(req, res) {
+  const user = await parseAuth(req);
   if (!user) {
     fail(res, '登录状态已失效，请重新登录。', 401, 'UNAUTHORIZED');
     return null;
@@ -1140,8 +841,8 @@ function requireAuth(req, res) {
   return user;
 }
 
-function requireAdmin(req, res) {
-  const user = requireAuth(req, res);
+async function requireAdmin(req, res) {
+  const user = await requireAuth(req, res);
   if (!user) return null;
   if (!['owner', 'admin'].includes(user.role) && !user.is_platform_admin) {
     fail(res, '仅管理员可执行此操作。', 403, 'FORBIDDEN');
@@ -1150,8 +851,8 @@ function requireAdmin(req, res) {
   return user;
 }
 
-function requirePlatformAdmin(req, res) {
-  const user = requireAuth(req, res);
+async function requirePlatformAdmin(req, res) {
+  const user = await requireAuth(req, res);
   if (!user) return null;
   if (!user.is_platform_admin) {
     fail(res, '仅平台管理员可执行此操作。', 403, 'FORBIDDEN');
@@ -1163,7 +864,6 @@ function requirePlatformAdmin(req, res) {
 /* ---------------- 校验 ---------------- */
 function validPhone(p) { return /^1[3-9]\d{9}$/.test(String(p || '').trim()); }
 function validEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e || '').trim()); }
-
 function publicUser(u) {
   if (!u) return null;
   const { password_hash, ...rest } = u;
@@ -1184,26 +884,26 @@ __define("server/lib/seed.js", function (module, exports, require, __dirname, __
  * 数据初始化：系统内置工艺库 + 组织副本 + 演示数据
  */
 const { db, uid, now } = require('./db');
-const { buildItems, GROUPS } = require('../../seed/library');
+const { buildItems, GROUPS } = require('./seed/library');
 
 /** 确保系统内置工艺库存在（org_id 为 null） */
-function initSystemLibrary() {
-  const exist = db.library.count((it) => !it.org_id);
+async function initSystemLibrary() {
+  const exist = await db.library.count((it) => !it.org_id);
   if (exist > 0) return exist;
   const items = buildItems().map((it) => ({ ...it, org_id: null, created_at: now() }));
-  db.library.insertMany(items);
-  db.library.flush();
+  await db.library.insertMany(items);
+  await db.library.flush();
   console.log(`[seed] 已初始化系统工艺库 ${items.length} 条`);
   return items.length;
 }
 
 /** 为新组织复制一份可编辑的工艺库副本 */
-function seedLibraryForOrg(orgId, opts = {}) {
-  const exist = db.library.count((it) => it.org_id === orgId);
+async function seedLibraryForOrg(orgId, opts = {}) {
+  const exist = await db.library.count((it) => it.org_id === orgId);
   if (exist > 0 && !opts.force) return exist;
-  if (exist > 0) db.library.removeWhere((it) => it.org_id === orgId);
+  if (exist > 0) await db.library.removeWhere((it) => it.org_id === orgId);
 
-  const systemItems = db.library.find((it) => !it.org_id);
+  const systemItems = await db.library.find((it) => !it.org_id);
   const src = systemItems.length ? systemItems : buildItems().map((it) => ({ ...it, org_id: null }));
   const copies = src.map((it) => ({
     ...it,
@@ -1213,19 +913,20 @@ function seedLibraryForOrg(orgId, opts = {}) {
     group_key: it.group_key || (GROUPS.find((g) => g.name === it.group_name) || {}).key || 'misc',
     created_at: now(),
   }));
-  db.library.insertMany(copies);
-  db.library.flush();
+  await db.library.insertMany(copies);
+  await db.library.flush();
   return copies.length;
 }
 
 /** 重置组织工艺库到系统默认 */
-function resetOrgLibrary(orgId) {
+async function resetOrgLibrary(orgId) {
   return seedLibraryForOrg(orgId, { force: true });
 }
 
 /** 为演示账号生成示例空间模板（用于模板管理页与智能造价复用） */
-function seedDemoTemplates(userId, orgId) {
-  if (db.templates.count((t) => t.org_id === orgId)) return 0;
+async function seedDemoTemplates(userId, orgId) {
+  const exist = await db.templates.count((t) => t.org_id === orgId);
+  if (exist > 0) return 0;
 
   const tpls = [
     {
@@ -1263,32 +964,35 @@ function seedDemoTemplates(userId, orgId) {
     },
   ];
 
-  const docs = tpls.map((t) => db.templates.insert({
-    id: uid(),
-    org_id: orgId,
-    user_id: userId,
-    building_type: '高层',
-    house_type: '新房',
-    city: '合肥',
-    source: 'preset',
-    created_at: now(),
-    ...t,
+  const docs = await Promise.all(tpls.map(async (t) => {
+    return await db.templates.insert({
+      id: uid(),
+      org_id: orgId,
+      user_id: userId,
+      building_type: '高层',
+      house_type: '新房',
+      city: '合肥',
+      source: 'preset',
+      created_at: now(),
+      ...t,
+    });
   }));
-  db.templates.flush();
+  await db.templates.flush();
   return docs.length;
 }
 
 /** 为演示账号生成示例报价 */
-function seedDemoQuotes(userId, orgId) {
-  if (db.quotes.count((q) => q.org_id === orgId)) return 0;
+async function seedDemoQuotes(userId, orgId) {
+  const exist = await db.quotes.count((q) => q.org_id === orgId);
+  if (exist > 0) return 0;
 
-  seedDemoTemplates(userId, orgId);
+  await seedDemoTemplates(userId, orgId);
 
-  const customers = [
+  const customers = await Promise.all([
     { name: '王女士', phone: '13805610001', community: '华润·幸福里', building_area: 108, layout: '三室两厅两卫' },
     { name: '李先生', phone: '13905610002', community: '万科·森林公园', building_area: 89, layout: '两室两厅一卫' },
     { name: '张女士', phone: '13705610003', community: '保利·西山林语', building_area: 132, layout: '四室两厅两卫' },
-  ].map((c) => db.customers.insert({ id: uid(), org_id: orgId, ...c, source: '到店', status: 'following', created_at: now() }));
+  ].map(async (c) => await db.customers.insert({ id: uid(), org_id: orgId, ...c, source: '到店', status: 'following', created_at: now() })));
 
   const ai = require('./ai');
   const demo = [
@@ -1299,7 +1003,7 @@ function seedDemoQuotes(userId, orgId) {
 
   let n = 0;
   for (const d of demo) {
-    const est = ai.estimate({
+    const est = await ai.estimate({
       city: d.city,
       building_area: d.customer.building_area,
       layout: d.customer.layout,
@@ -1312,11 +1016,12 @@ function seedDemoQuotes(userId, orgId) {
     });
     const qid = uid();
     const total = est.total;
-    const quote = db.quotes.insert({
+    const quoteNumber = await genQuoteNo(orgId);
+    const quote = await db.quotes.insert({
       id: qid,
       org_id: orgId,
       user_id: userId,
-      quote_number: genQuoteNo(orgId),
+      quote_number: quoteNumber,
       title: `${d.customer.community} ${d.customer.building_area}㎡ ${d.customer.layout} 装修报价`,
       customer_id: d.customer.id,
       customer_name: d.customer.name,
@@ -1340,20 +1045,20 @@ function seedDemoQuotes(userId, orgId) {
       created_at: new Date(Date.now() - d.days * 86400000).toISOString(),
       updated_at: now(),
     });
-    db.quote_items.insertMany(
+    await db.quote_items.insertMany(
       est.items.map((it) => ({ ...it, id: uid(), quote_id: qid, org_id: orgId, created_at: now() }))
     );
     n += 1;
   }
-  db.quotes.flush();
-  db.quote_items.flush();
+  await db.quotes.flush();
+  await db.quote_items.flush();
   return n;
 }
 
-function genQuoteNo(orgId) {
+async function genQuoteNo(orgId) {
   const d = new Date();
   const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-  const seq = db.quotes.count((q) => q.org_id === orgId) + 1;
+  const seq = (await db.quotes.count((q) => q.org_id === orgId)) + 1;
   return `BJ${ymd}${String(seq).padStart(3, '0')}`;
 }
 
@@ -1501,51 +1206,54 @@ const FEATURE_COSTS = {
 };
 
 /* =========================================================
-   二、工程量计算模型
+   二、工程量计算模型（含 DB 查询均走 async）
    ========================================================= */
 
-function libItem(name, orgId) {
+/** 缓存：按 (name, orgId) 为 key 的已查询 item，避免重复 DB 调用 */
+const _libCache = new Map();
+
+async function libItem(name, orgId) {
+  const key = `${name}::${orgId || 'sys'}`;
+  if (_libCache.has(key)) return _libCache.get(key);
   // 优先取系统内置基准库，其次取组织自有库
-  return (
-    db.library.findOne((it) => it.name === name && !it.org_id) ||
-    (orgId ? db.library.findOne((it) => it.name === name && it.org_id === orgId) : null) ||
-    db.library.findOne((it) => it.name === name) ||
-    null
-  );
+  const r =
+    (await db.library.findOne((it) => it.name === name && !it.org_id)) ||
+    (orgId ? await db.library.findOne((it) => it.name === name && it.org_id === orgId) : null) ||
+    (await db.library.findOne((it) => it.name === name)) ||
+    null;
+  _libCache.set(key, r);
+  return r;
 }
 
-function libPrice(name, fallback) {
-  const it = libItem(name);
+async function libPrice(name, fallback) {
+  const it = await libItem(name);
   return it ? it.price : fallback;
 }
 
-function libCost(name, fallbackRatio = 0.66) {
-  const it = libItem(name);
-  if (it) return it.cost || Math.round(it.price * 0.68 * 100) / 100;
-  return Math.round((libPrice(name, 0) || 0) * fallbackRatio * 100) / 100;
+async function libCost(name, fallbackRatio = 0.66) {
+  const it = await libItem(name);
+  if (it) return it.cost || Math.round(it.price * 0.66 * 100) / 100;
+  return Math.round(((await libPrice(name, 0)) || 0) * fallbackRatio * 100) / 100;
 }
 
-function libUnit(name, fallback) {
-  const it = libItem(name);
+async function libUnit(name, fallback) {
+  const it = await libItem(name);
   return it ? it.unit : fallback;
 }
 
 /**
  * 取当前组织可用的工艺库：优先该组织自有副本，否则回落到系统基准库
- * 注意：绝不返回全库，否则会把其他组织的数据混进来
  */
-function scopeItems(orgId) {
-  const own = orgId ? db.library.find((it) => it.org_id === orgId) : [];
+async function scopeItems(orgId) {
+  const own = orgId ? await db.library.find((it) => it.org_id === orgId) : [];
   if (own.length) return own;
   return db.library.find((it) => !it.org_id);
 }
 
 /**
  * 按空间生成报价条目
- * @param {Object} p 项目参数
- * @returns {{items:Array, assumptions:Array}}
  */
-function generateQuoteItems(p) {
+async function generateQuoteItems(p) {
   const {
     city = '',
     building_area = 100,
@@ -1587,11 +1295,12 @@ function generateQuoteItems(p) {
 
   const items = [];
   const assumptions = [];
-  const push = (group, name, qty, unitOverride) => {
-    const unit = unitOverride || libUnit(name, '项');
-    const price = Math.round(libPrice(name, 50) * k * 100) / 100;
-    const cost = Math.round(libCost(name) * k * 100) / 100;
+  const push = async (group, name, qty, unitOverride) => {
+    const unit = unitOverride || (await libUnit(name, '项'));
+    const price = Math.round((await libPrice(name, 50)) * k * 100) / 100;
+    const cost = Math.round(await libCost(name) * k * 100) / 100;
     if (qty <= 0) return;
+    const item = await libItem(name);
     items.push({
       group_name: group,
       name,
@@ -1600,105 +1309,105 @@ function generateQuoteItems(p) {
       unit_price: price,
       cost_price: cost,
       amount: Math.round(price * qty * 100) / 100,
-      craft: (libItem(name) || {}).craft || '',
+      craft: item ? item.craft : '',
       source: 'ai',
     });
   };
 
   /* --- 1. 拆除与保护（老房 / 翻新） --- */
   if (isOld) {
-    push('拆除与保护', '旧墙皮铲除', totalUsable * 2.4);
-    push('拆除与保护', '地面瓷砖拆除', totalUsable * 0.9);
-    push('拆除与保护', '墙体拆除（非承重）', Math.max(0, totalUsable * 0.06));
-    push('拆除与保护', '洁具拆除', 2);
-    push('拆除与保护', '垃圾装袋外运', Math.max(3, area * 0.09));
+    await push('拆除与保护', '旧墙皮铲除', totalUsable * 2.4);
+    await push('拆除与保护', '地面瓷砖拆除', totalUsable * 0.9);
+    await push('拆除与保护', '墙体拆除（非承重）', Math.max(0, totalUsable * 0.06));
+    await push('拆除与保护', '洁具拆除', 2);
+    await push('拆除与保护', '垃圾装袋外运', Math.max(3, area * 0.09));
   }
-  push('拆除与保护', '成品保护（地面）', totalUsable * 0.9);
-  push('拆除与保护', '成品保护（门窗家具）', 1);
+  await push('拆除与保护', '成品保护（地面）', totalUsable * 0.9);
+  await push('拆除与保护', '成品保护（门窗家具）', 1);
   if (!has_elevator && floor > 3) {
-    push('拆除与保护', '上楼费（3层以上每层）', floor - 3);
+    await push('拆除与保护', '上楼费（3层以上每层）', floor - 3);
   }
 
   /* --- 2. 水电工程 --- */
   const wireLen = isOld ? area * 4.2 : area * 3.2;
   const pipeLen = isOld ? area * 0.85 : area * 0.6;
-  push('水电工程', '强电布线 2.5mm²（暗线含开槽）', wireLen);
-  push('水电工程', '强电布线 4mm²（空调/厨房）', area * 0.9);
-  push('水电工程', '给水管改造 PPR（暗管含开槽）', pipeLen);
-  push('水电工程', '排水管改造 PVC', area * 0.35);
-  push('水电工程', '弱电布线（超五类网线）', area * 0.8);
-  push('水电工程', '电线开槽（砖墙）', wireLen * 0.7);
-  push('水电工程', '底盒安装', Math.round(area * 0.55));
-  push('水电工程', '水管试压', 1);
-  push('水电工程', '配电箱安装', isOld ? 1 : 0);
-  push('水电工程', '开关插座安装（五孔）', Math.round(area * 0.45));
-  push('水电工程', '地漏安装', Math.max(2, Math.round(bathArea / 3)));
+  await push('水电工程', '强电布线 2.5mm²（暗线含开槽）', wireLen);
+  await push('水电工程', '强电布线 4mm²（空调/厨房）', area * 0.9);
+  await push('水电工程', '给水管改造 PPR（暗管含开槽）', pipeLen);
+  await push('水电工程', '排水管改造 PVC', area * 0.35);
+  await push('水电工程', '弱电布线（超五类网线）', area * 0.8);
+  await push('水电工程', '电线开槽（砖墙）', wireLen * 0.7);
+  await push('水电工程', '底盒安装', Math.round(area * 0.55));
+  await push('水电工程', '水管试压', 1);
+  await push('水电工程', '配电箱安装', isOld ? 1 : 0);
+  await push('水电工程', '开关插座安装（五孔）', Math.round(area * 0.45));
+  await push('水电工程', '地漏安装', Math.max(2, Math.round(bathArea / 3)));
 
   /* --- 3. 泥瓦工程 --- */
-  push('泥瓦工程', '地面现拌砂浆找平', totalUsable * 0.9);
-  push('泥瓦工程', '厨卫墙地面防水（聚合物水泥基三遍）', (kitchenArea + bathArea) * 1.75);
-  push('泥瓦工程', '闭水试验', 1);
-  push('泥瓦工程', '墙砖薄贴（300×600）', kitchenArea * 2.2 + bathArea * 3.4);
-  push('泥瓦工程', '地砖薄贴（800×800）', totalUsable * 0.78);
-  push('泥瓦工程', '瓷砖美缝', (kitchenArea * 2.2 + bathArea * 3.4 + totalUsable * 0.78) * 0.85);
-  push('泥瓦工程', '踢脚线安装（瓷砖/石材）', totalUsable * 0.32);
-  push('泥瓦工程', '门槛石/窗台石安装', Math.max(4, Object.keys(spaceMap).length * 0.9));
-  push('泥瓦工程', '厨卫包立管', Math.max(1, Math.round((kitchenArea + bathArea) / 12)));
-  push('泥瓦工程', '墙面拉毛处理', kitchenArea * 2.2 + bathArea * 3.4);
-  push('泥瓦工程', '墙面界面剂（墙固）', totalUsable * 2.4);
+  await push('泥瓦工程', '地面现拌砂浆找平', totalUsable * 0.9);
+  await push('泥瓦工程', '厨卫墙地面防水（聚合物水泥基三遍）', (kitchenArea + bathArea) * 1.75);
+  await push('泥瓦工程', '闭水试验', 1);
+  await push('泥瓦工程', '墙砖薄贴（300×600）', kitchenArea * 2.2 + bathArea * 3.4);
+  await push('泥瓦工程', '地砖薄贴（800×800）', totalUsable * 0.78);
+  await push('泥瓦工程', '瓷砖美缝', (kitchenArea * 2.2 + bathArea * 3.4 + totalUsable * 0.78) * 0.85);
+  await push('泥瓦工程', '踢脚线安装（瓷砖/石材）', totalUsable * 0.32);
+  await push('泥瓦工程', '门槛石/窗台石安装', Math.max(4, Object.keys(spaceMap).length * 0.9));
+  await push('泥瓦工程', '厨卫包立管', Math.max(1, Math.round((kitchenArea + bathArea) / 12)));
+  await push('泥瓦工程', '墙面拉毛处理', kitchenArea * 2.2 + bathArea * 3.4);
+  await push('泥瓦工程', '墙面界面剂（墙固）', totalUsable * 2.4);
 
   /* --- 4. 木作吊顶 --- */
   const ceilArea = totalUsable * (tier === '简装' ? 0.12 : tier === '中档' ? 0.22 : 0.34);
   if (ceilArea > 3) {
-    push('木作吊顶', '轻钢龙骨石膏板平吊顶', ceilArea * 0.7);
-    push('木作吊顶', '局部吊顶（边顶/灯槽）', totalUsable * 0.28);
+    await push('木作吊顶', '轻钢龙骨石膏板平吊顶', ceilArea * 0.7);
+    await push('木作吊顶', '局部吊顶（边顶/灯槽）', totalUsable * 0.28);
   }
-  push('木作吊顶', '铝扣板吊顶（厨卫）', kitchenArea + bathArea);
-  push('木作吊顶', '石膏线安装', totalUsable * 0.42);
-  push('木作吊顶', '木作窗帘盒', Object.keys(spaceMap).filter((n) => !n.includes('卫') && !n.includes('厨')).length * 3.2);
+  await push('木作吊顶', '铝扣板吊顶（厨卫）', kitchenArea + bathArea);
+  await push('木作吊顶', '石膏线安装', totalUsable * 0.42);
+  await push('木作吊顶', '木作窗帘盒', Object.keys(spaceMap).filter((n) => !n.includes('卫') && !n.includes('厨')).length * 3.2);
   if (tier === '高档' || tier === '定制') {
-    push('木作吊顶', '电视背景墙基层', 8);
+    await push('木作吊顶', '电视背景墙基层', 8);
   }
 
   /* --- 5. 油漆涂装 --- */
   const wallArea = totalUsable * 2.5;
-  push('油漆涂装', '墙面基层修补', wallArea * 0.35);
-  push('油漆涂装', '墙面挂网（防裂）', wallArea * (isOld ? 1 : 0.35));
-  push('油漆涂装', '腻子批刮（三遍）', wallArea);
-  push('油漆涂装', '墙面打磨', wallArea);
-  push('油漆涂装', '墙面刷乳胶漆（底漆一遍+面漆两遍）', wallArea * 0.82);
-  push('油漆涂装', '顶面刷乳胶漆', totalUsable * 0.9);
-  push('油漆涂装', '乳胶漆调色（每色）', tier === '简装' ? 0 : 1);
-  push('油漆涂装', '石膏线刷漆', totalUsable * 0.42);
+  await push('油漆涂装', '墙面基层修补', wallArea * 0.35);
+  await push('油漆涂装', '墙面挂网（防裂）', wallArea * (isOld ? 1 : 0.35));
+  await push('油漆涂装', '腻子批刮（三遍）', wallArea);
+  await push('油漆涂装', '墙面打磨', wallArea);
+  await push('油漆涂装', '墙面刷乳胶漆（底漆一遍+面漆两遍）', wallArea * 0.82);
+  await push('油漆涂装', '顶面刷乳胶漆', totalUsable * 0.9);
+  await push('油漆涂装', '乳胶漆调色（每色）', tier === '简装' ? 0 : 1);
+  await push('油漆涂装', '石膏线刷漆', totalUsable * 0.42);
 
   /* --- 6. 安装五金 --- */
-  push('安装五金', '筒灯/射灯安装', Math.round(area * 0.28));
-  push('安装五金', '主灯安装', Math.max(3, Object.keys(spaceMap).length - 2));
-  push('安装五金', '开关插座面板安装', Math.round(area * 0.45));
-  push('安装五金', '木地板安装', totalUsable * (tier === '简装' ? 0.45 : 0.62));
-  push('安装五金', '室内门安装', Math.max(2, Object.keys(spaceMap).filter((n) => n.includes('卧') || n.includes('书房')).length + 1));
-  push('安装五金', '窗台石英石安装', Math.max(3, Object.keys(spaceMap).length * 0.7));
-  push('安装五金', '马桶安装', layout.includes('两卫') ? 2 : 1);
-  push('安装五金', '浴室柜/台盆安装', layout.includes('两卫') ? 2 : 1);
-  push('安装五金', '淋浴花洒安装', layout.includes('两卫') ? 2 : 1);
-  push('安装五金', '窗帘杆/轨道安装', Math.max(4, Object.keys(spaceMap).length * 2.4));
-  push('安装五金', '晾衣架安装', 1);
-  push('安装五金', '毛巾架/五金挂件安装', layout.includes('两卫') ? 6 : 4);
+  await push('安装五金', '筒灯/射灯安装', Math.round(area * 0.28));
+  await push('安装五金', '主灯安装', Math.max(3, Object.keys(spaceMap).length - 2));
+  await push('安装五金', '开关插座面板安装', Math.round(area * 0.45));
+  await push('安装五金', '木地板安装', totalUsable * (tier === '简装' ? 0.45 : 0.62));
+  await push('安装五金', '室内门安装', Math.max(2, Object.keys(spaceMap).filter((n) => n.includes('卧') || n.includes('书房')).length + 1));
+  await push('安装五金', '窗台石英石安装', Math.max(3, Object.keys(spaceMap).length * 0.7));
+  await push('安装五金', '马桶安装', layout.includes('两卫') ? 2 : 1);
+  await push('安装五金', '浴室柜/台盆安装', layout.includes('两卫') ? 2 : 1);
+  await push('安装五金', '淋浴花洒安装', layout.includes('两卫') ? 2 : 1);
+  await push('安装五金', '窗帘杆/轨道安装', Math.max(4, Object.keys(spaceMap).length * 2.4));
+  await push('安装五金', '晾衣架安装', 1);
+  await push('安装五金', '毛巾架/五金挂件安装', layout.includes('两卫') ? 6 : 4);
 
   /* --- 7. 定制主材（中高档才含） --- */
   if (pkg && (pkg.code === 'hardcover-all' || tier === '高档' || tier === '定制')) {
-    push('定制主材', '橱柜地柜（含台面）', Math.max(2.5, kitchenArea * 0.55));
-    push('定制主材', '橱柜吊柜', Math.max(1.8, kitchenArea * 0.4));
-    push('定制主材', '衣柜柜体（投影面积）', Math.max(4, totalUsable * 0.075));
-    push('定制主材', '玄关柜/鞋柜', 1.6);
+    await push('定制主材', '橱柜地柜（含台面）', Math.max(2.5, kitchenArea * 0.55));
+    await push('定制主材', '橱柜吊柜', Math.max(1.8, kitchenArea * 0.4));
+    await push('定制主材', '衣柜柜体（投影面积）', Math.max(4, totalUsable * 0.075));
+    await push('定制主材', '玄关柜/鞋柜', 1.6);
   }
 
   /* --- 8. 措施与其他 --- */
-  push('措施与其他', '施工管理费', area);
-  push('措施与其他', '竣工开荒保洁', totalUsable);
-  push('措施与其他', '材料运输费', 1);
-  push('措施与其他', '施工水电费', 1);
-  if (!isOld) push('措施与其他', '成品保护费', 1);
+  await push('措施与其他', '施工管理费', area);
+  await push('措施与其他', '竣工开荒保洁', totalUsable);
+  await push('措施与其他', '材料运输费', 1);
+  await push('措施与其他', '施工水电费', 1);
+  if (!isOld) await push('措施与其他', '成品保护费', 1);
 
   /* --- 假设说明 --- */
   assumptions.push(`按建筑面积 ${area} m²、得房系数 ${(usableRatio(building_type) * 100).toFixed(0)}% 推算套内面积约 ${totalUsable.toFixed(1)} m²`);
@@ -1734,8 +1443,8 @@ function guessLayout(layout) {
 }
 
 /** 完整估算主入口 */
-function estimate(p) {
-  const { items, assumptions } = generateQuoteItems(p);
+async function estimate(p) {
+  const { items, assumptions } = await generateQuoteItems(p);
   const total = Math.round(items.reduce((s, i) => s + i.amount, 0) * 100) / 100;
   const cost = Math.round(items.reduce((s, i) => s + i.cost_price * i.qty, 0) * 100) / 100;
   const area = Number(p.building_area) || 100;
@@ -1782,7 +1491,7 @@ const FEATURES = {
   /** 智能估算：生成报价草稿 */
   'smart-estimate': async (p) => {
     const pkg = p.package_code ? PACKAGES.find((x) => x.code === p.package_code) : null;
-    const res = estimate({ ...p, pkg });
+    const res = await estimate({ ...p, pkg });
     return {
       ...res,
       summary: `按 ${p.city || '当地'} ${p.building_area}m² ${p.layout || ''} ${p.tier || '中档'} 口径，综合空间清单与工艺库生成，共 ${res.items.length} 条明细。`,
@@ -1792,7 +1501,7 @@ const FEATURES = {
   'full-estimate': async (p) => FEATURES['smart-estimate'](p),
 
   'estimate-cost': async (p) => {
-    const res = estimate(p);
+    const res = await estimate(p);
     return {
       total: res.total,
       per_sqm: res.per_sqm,
@@ -1924,7 +1633,7 @@ const FEATURES = {
     const text = String(p.text || '');
     const city = p.city;
     const cf = cityFactor(city);
-    const all = db.library.all();
+    const all = await db.library.all();
     const items = [];
 
     // 1) 直接命中工艺库关键词
@@ -1958,8 +1667,8 @@ const FEATURES = {
   /** 单点价格建议 */
   'price-suggestion': async (p) => {
     const cf = cityFactor(p.city);
-    const lib = db.library.findOne((x) => x.name === p.item_name) ||
-      db.library.findOne((x) => (x.tags || []).some((t) => String(p.item_name || '').includes(t)));
+    const lib = await db.library.findOne((x) => x.name === p.item_name) ||
+      await db.library.findOne((x) => (x.tags || []).some((t) => String(p.item_name || '').includes(t)));
     const base = lib ? lib.price : Number(p.current_price) || 50;
     return {
       item_name: p.item_name,
@@ -1980,10 +1689,11 @@ const FEATURES = {
   /** 相似项推荐 */
   'item-suggestion': async (p) => {
     const name = String(p.item_name || '');
-    const lib = db.library.findOne((x) => x.name === name);
+    const lib = await db.library.findOne((x) => x.name === name);
     if (!lib) return { suggestions: [] };
     const cf = cityFactor(p.city);
-    const sug = db.library
+    const allItems = await db.library.all();
+    const sug = allItems
       .filter((x) => x.group_key === lib.group_key && x.id !== lib.id)
       .map((x) => ({ ...x, score: similarity(name, x.name) }))
       .sort((a, b) => b.score - a.score)
@@ -2007,15 +1717,19 @@ const FEATURES = {
     if (!items.some((i) => /闭水|试压/.test(i.name || ''))) missing.push({ type: '缺验收项', detail: '未发现闭水试验 / 打压试验' });
     if (!items.some((i) => /保护|清运|保洁/.test(i.name || ''))) missing.push({ type: '缺措施费', detail: '未发现成品保护 / 垃圾清运 / 保洁' });
 
+    const allLibs = await db.library.all();
+    const libMap = {};
+    for (const lib of allLibs) libMap[lib.name] = lib;
+
     const anomalies = items
       .filter((i) => {
-        const lib = db.library.findOne((x) => x.name === i.name);
+        const lib = libMap[i.name];
         if (!lib) return false;
         const price = Number(i.unit_price) || 0;
         return price > lib.price * 1.35 || price < lib.price * 0.62;
       })
       .map((i) => {
-        const lib = db.library.findOne((x) => x.name === i.name);
+        const lib = libMap[i.name];
         return { name: i.name, current: i.unit_price, reference: lib.price, level: (Number(i.unit_price) || 0) > lib.price * 1.35 ? 'high' : 'low' };
       });
 
@@ -2111,7 +1825,7 @@ const FEATURES = {
 
   /** 价格库体检：按「同分类 + 同单位」比较，避免跨量级误报 */
   'price-library-audit': async (p) => {
-    const items = scopeItems(p.org_id);
+    const items = await scopeItems(p.org_id);
     const issues = [];
 
     // 1) 离群价：只在同分类且同单位的组内比较，且组内至少 5 条才判定
@@ -2164,7 +1878,7 @@ const FEATURES = {
     const target = p.target_city || '';
     const factor = cityFactor(target);
     const tierName = cityTierName(target);
-    const items = scopeItems(p.org_id);
+    const items = await scopeItems(p.org_id);
     const sample = items.slice(0, 60).map((x) => ({
       name: x.name,
       unit: x.unit,
@@ -2186,13 +1900,16 @@ const FEATURES = {
 
   /** 审计异常预警 */
   'audit-risk': async (p) => {
-    const logs = db.ai_logs.all().slice(-500);
+    const logs = (await db.ai_logs.all()).slice(-500);
     const byUser = {};
     logs.forEach((l) => { byUser[l.user_id] = (byUser[l.user_id] || 0) + 1; });
     const alerts = [];
+    const allUsers = await db.users.all();
+    const userMap = {};
+    allUsers.forEach((u) => { userMap[u.id] = u; });
     Object.entries(byUser).forEach(([uid, count]) => {
       if (count > 60) {
-        const u = db.users.findOne({ id: uid });
+        const u = userMap[uid];
         alerts.push({ level: '中', type: '高频调用', user: u ? u.name || u.phone : uid, count, advice: '确认是否为批量测试或接口抓取' });
       }
     });
@@ -2331,6 +2048,7 @@ function costOf(feature) { return FEATURE_COSTS[feature] ?? 5; }
 module.exports = {
   run, costOf, FEATURES, FEATURE_COSTS, PACKAGES, TIERS, LAYOUTS, CITY_TIERS,
   cityFactor, cityTierName, breakdownRooms, estimate, generateQuoteItems, spaceType,
+  libItem, libPrice, libCost, libUnit, scopeItems,
   provider,
 };
 });
@@ -2354,19 +2072,19 @@ const PLANS = {
 
 /** 内存验证码（重启即失效，够用且安全） */
 const CODE_TTL = 5 * 60 * 1000;
-function setCode(key, code) {
-  db.sessions.removeWhere((s) => s.key === `code:${key}`);
-  db.sessions.insert({ id: uid(), key: `code:${key}`, code, expire_at: Date.now() + CODE_TTL });
+async function setCode(key, code) {
+  await db.sessions.removeWhere((s) => s.key === `code:${key}`);
+  await db.sessions.insert({ id: uid(), key: `code:${key}`, code, expire_at: Date.now() + CODE_TTL });
 }
-function getCode(key) {
-  const rec = db.sessions.findOne((s) => s.key === `code:${key}`);
+async function getCode(key) {
+  const rec = await db.sessions.findOne((s) => s.key === `code:${key}`);
   if (!rec) return null;
-  if (rec.expire_at < Date.now()) { db.sessions.remove(rec.id); return null; }
+  if (rec.expire_at < Date.now()) { await db.sessions.remove(rec.id); return null; }
   return rec.code;
 }
 
 /** 每月发放套餐赠送点数 */
-function grantMonthlyCredits(user) {
+async function grantMonthlyCredits(user) {
   const ym = new Date().toISOString().slice(0, 7);
   if (user.credits_month === ym) return user;
   const plan = PLANS[user.plan] || PLANS.free;
@@ -2386,7 +2104,7 @@ module.exports = function register(router) {
     const phone = String(body.phone || '').trim();
     if (!A.validPhone(phone)) return fail(res, '请输入正确的 11 位手机号。');
     const code = String(Math.floor(100000 + Math.random() * 900000));
-    setCode(phone, code);
+    await setCode(phone, code);
     ok(res, {
       sent: true,
       // 本地部署：无短信网关，直接回传验证码便于自测；生产环境应删除此字段
@@ -2403,18 +2121,18 @@ module.exports = function register(router) {
     if (!A.validPhone(phone)) return fail(res, '请输入正确的 11 位手机号。');
     if (!code) return fail(res, '请输入短信验证码。');
 
-    const real = getCode(phone);
+    const real = await getCode(phone);
     if (!real) return fail(res, '验证码已过期，请重新获取。');
     if (real !== code) return fail(res, '账号不存在或验证码错误。');
 
-    let user = db.users.findOne({ phone });
+    let user = await db.users.findOne({ phone });
     if (!user) {
-      user = createUser({ phone, name: `用户${phone.slice(-4)}`, plan: 'free' });
+      user = await createUser({ phone, name: `用户${phone.slice(-4)}`, plan: 'free' });
     } else if (user.status === 'disabled') {
       return fail(res, '账号已被停用，请联系管理员。', 403);
     }
-    db.sessions.removeWhere((s) => s.key === `code:${phone}`);
-    finishLogin(res, user);
+    await db.sessions.removeWhere((s) => s.key === `code:${phone}`);
+    await finishLogin(res, user);
   });
 
   /* ---------- 账号密码登录 ---------- */
@@ -2423,12 +2141,12 @@ module.exports = function register(router) {
     const pwd = String(body.password || '');
     if (!account || !pwd) return fail(res, '请输入账号和密码。');
 
-    const user = db.users.findOne({ phone: account }) || db.users.findOne({ email: account });
+    const user = await db.users.findOne({ phone: account }) || await db.users.findOne({ email: account });
     if (!user) return fail(res, '账号不存在或密码错误。', 401);
     if (!A.verifyPassword(pwd, user.password_hash)) return fail(res, '账号不存在或密码错误。', 401);
     if (user.status === 'disabled') return fail(res, '账号已被停用，请联系管理员。', 403);
 
-    finishLogin(res, user);
+    await finishLogin(res, user);
   });
 
   /* ---------- 注册 ---------- */
@@ -2440,24 +2158,24 @@ module.exports = function register(router) {
 
     if (!A.validPhone(phone)) return fail(res, '请输入正确的 11 位手机号。');
     if (pwd.length < 6) return fail(res, '密码至少 6 位。');
-    if (db.users.findOne({ phone })) return fail(res, '该手机号已注册，请直接登录。');
+    if (await db.users.findOne({ phone })) return fail(res, '该手机号已注册，请直接登录。');
 
     if (code) {
-      const real = getCode(phone);
+      const real = await getCode(phone);
       if (!real) return fail(res, '验证码已过期，请重新获取。');
       if (real !== code) return fail(res, '验证码错误。');
-      db.sessions.removeWhere((s) => s.key === `code:${phone}`);
+      await db.sessions.removeWhere((s) => s.key === `code:${phone}`);
     }
 
-    const user = createUser({ phone, password: pwd, name: name || `用户${phone.slice(-4)}`, email: body.email, plan: body.plan || 'free' });
-    finishLogin(res, user, 201);
+    const user = await createUser({ phone, password: pwd, name: name || `用户${phone.slice(-4)}`, email: body.email, plan: body.plan || 'free' });
+    await finishLogin(res, user, 201);
   });
 
   /* ---------- 刷新令牌 ---------- */
   api.post('/auth/refresh', async (req, res, body) => {
     const payload = A.verify(String(body.refresh_token || ''));
     if (!payload || payload.type !== 'refresh') return fail(res, '登录状态已失效，请重新登录。', 401);
-    const user = db.users.findOne({ id: payload.sub });
+    const user = await db.users.findOne({ id: payload.sub });
     if (!user || user.status === 'disabled') return fail(res, '登录状态已失效，请重新登录。', 401);
     ok(res, { ...A.issueTokens(user), user: A.publicUser(user) });
   });
@@ -2467,10 +2185,10 @@ module.exports = function register(router) {
 
   /* ---------- 当前用户 ---------- */
   api.get('/users/me', async (req, res) => {
-    let user = A.requireAuth(req, res);
+    let user = await A.requireAuth(req, res);
     if (!user) return;
-    user = grantMonthlyCredits(user);
-    const org = db.orgs.findOne({ id: user.org_id });
+    user = await grantMonthlyCredits(user);
+    const org = await db.orgs.findOne({ id: user.org_id });
     ok(res, {
       ...A.publicUser(user),
       org: org || null,
@@ -2480,106 +2198,106 @@ module.exports = function register(router) {
   });
 
   api.put('/users/me', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const patch = {};
     ['name', 'avatar', 'phone2', 'company', 'title'].forEach((k) => {
       if (body[k] !== undefined) patch[k] = body[k];
     });
-    const updated = db.users.update(user.id, patch);
+    const updated = await db.users.update(user.id, patch);
     ok(res, A.publicUser(updated));
   });
 
   api.put('/users/me/password', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!A.verifyPassword(String(body.old_password || ''), user.password_hash)) {
       return fail(res, '原密码不正确。');
     }
     if (String(body.new_password || '').length < 6) return fail(res, '新密码至少 6 位。');
-    db.users.update(user.id, { password_hash: A.hashPassword(body.new_password) });
+    await db.users.update(user.id, { password_hash: A.hashPassword(body.new_password) });
     ok(res, { ok: true, message: '密码已更新。' });
   });
 
   api.get('/users/plan-info', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, planInfo(user));
   });
 
   api.get('/users/me/permissions', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, permissionsOf(user));
   });
 
   /* ---------- 组织 ---------- */
   api.get('/org/profile', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, db.orgs.findOne({ id: user.org_id }) || {});
+    ok(res, await db.orgs.findOne({ id: user.org_id }) || {});
   });
 
   api.put('/org/profile', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!['owner', 'admin'].includes(user.role)) return fail(res, '仅管理员可修改组织信息。', 403);
     const patch = {};
     ['name', 'logo', 'phone', 'address', 'intro', 'brand_color'].forEach((k) => {
       if (body[k] !== undefined) patch[k] = body[k];
     });
-    ok(res, db.orgs.update(user.org_id, patch));
+    ok(res, await db.orgs.update(user.org_id, patch));
   });
 
   api.get('/org/settings', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const org = db.orgs.findOne({ id: user.org_id }) || {};
+    const org = await db.orgs.findOne({ id: user.org_id }) || {};
     ok(res, org.settings || defaultOrgSettings());
   });
 
   api.put('/org/settings', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!['owner', 'admin'].includes(user.role)) return fail(res, '仅管理员可修改设置。', 403);
-    const org = db.orgs.findOne({ id: user.org_id });
+    const org = await db.orgs.findOne({ id: user.org_id });
     const merged = { ...defaultOrgSettings(), ...(org.settings || {}), ...(body.settings || body) };
-    db.orgs.update(user.org_id, { settings: merged });
+    await db.orgs.update(user.org_id, { settings: merged });
     ok(res, merged);
   });
 
   /* ---------- 成员（团队） ---------- */
   api.get('/users', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const list = db.users.find({ org_id: user.org_id }).map(A.publicUser);
+    const list = (await db.users.find({ org_id: user.org_id })).map(A.publicUser);
     ok(res, list);
   });
 
   api.put('/users/:id/role', async (req, res, body, params) => {
-    const user = A.requireAdmin(req, res);
+    const user = await A.requireAdmin(req, res);
     if (!user) return;
-    const target = db.users.findOne({ id: params.id });
+    const target = await db.users.findOne({ id: params.id });
     if (!target || target.org_id !== user.org_id) return fail(res, '成员不存在。', 404);
     if (!['owner', 'admin', 'member'].includes(body.role)) return fail(res, '角色不合法。');
-    ok(res, A.publicUser(db.users.update(target.id, { role: body.role })));
+    ok(res, A.publicUser(await db.users.update(target.id, { role: body.role })));
   });
 
   api.post('/users/invitations', async (req, res, body) => {
-    const user = A.requireAdmin(req, res);
+    const user = await A.requireAdmin(req, res);
     if (!user) return;
     const phone = String(body.phone || '').trim();
     if (!A.validPhone(phone)) return fail(res, '请输入正确的 11 位手机号。');
-    ok(res, db.notifications.insert({
+    ok(res, await db.notifications.insert({
       id: uid(), org_id: user.org_id, type: 'invitation', phone,
       role: body.role || 'member', status: 'pending', invited_by: user.id,
     }));
   });
 
   api.get('/users/invitations', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, db.notifications.find({ org_id: user.org_id, type: 'invitation' }));
+    ok(res, await db.notifications.find({ org_id: user.org_id, type: 'invitation' }));
   });
 
   /* ---------- 公开配置 ---------- */
@@ -2596,18 +2314,19 @@ module.exports = function register(router) {
 
 /* ---------------- 内部函数 ---------------- */
 
-function createUser({ phone, password, name, email, plan }) {
-  const org = db.orgs.insert({
+async function createUser({ phone, password, name, email, plan }) {
+  const org = await db.orgs.insert({
     id: uid(),
     name: `${name || phone} 的团队`,
     plan: plan || 'free',
     created_at: now(),
   });
   // 为新组织初始化一份可编辑的工艺库副本
-  seedLibraryForOrg(org.id);
+  await seedLibraryForOrg(org.id);
 
   const ym = new Date().toISOString().slice(0, 7);
-  const user = db.users.insert({
+  const userCount = await db.users.count();
+  const user = await db.users.insert({
     id: uid(),
     phone,
     email: email || '',
@@ -2622,17 +2341,16 @@ function createUser({ phone, password, name, email, plan }) {
     export_used: 0,
     export_purchased: 0,
     // 仅当系统里一个用户都没有时，首个注册者自动成为平台管理员。
-    // 注意：必须是 === 0 —— 用 === 1 会让「已有 1 个用户」时注册的新账号也拿到管理员权限。
-    is_platform_admin: db.users.count() === 0,
+    is_platform_admin: userCount === 0,
     created_at: now(),
   });
   return user;
 }
 
-function finishLogin(res, user, status = 200) {
-  user = grantMonthlyCredits(user);
-  db.users.update(user.id, { last_login_at: now() });
-  const org = db.orgs.findOne({ id: user.org_id });
+async function finishLogin(res, user, status = 200) {
+  user = await grantMonthlyCredits(user);
+  await db.users.update(user.id, { last_login_at: now() });
+  const org = await db.orgs.findOne({ id: user.org_id });
   res.statusCode = status;
   ok(res, {
     ...A.issueTokens(user),
@@ -2728,22 +2446,22 @@ const TRANSITIONS = {
   archived: ['draft'],
 };
 
-function itemsOf(quoteId) {
-  return db.quote_items.find({ quote_id: quoteId }).map((i) => ({
+async function itemsOf(quoteId) {
+  return (await db.quote_items.find({ quote_id: quoteId })).map((i) => ({
     ...i,
     subtotal: Math.round((Number(i.unit_price) || 0) * (Number(i.qty) || 0) * 100) / 100,
   }));
 }
 
-function recalc(quoteId) {
-  const items = itemsOf(quoteId);
+async function recalc(quoteId) {
+  const items = await itemsOf(quoteId);
   const total = Math.round(items.reduce((s, i) => s + (Number(i.unit_price) || 0) * (Number(i.qty) || 0), 0) * 100) / 100;
   const cost = Math.round(items.reduce((s, i) => s + (Number(i.cost_price) || 0) * (Number(i.qty) || 0), 0) * 100) / 100;
-  const q = db.quotes.findOne({ id: quoteId });
+  const q = await db.quotes.findOne({ id: quoteId });
   const taxRate = Number(q && q.tax_rate) || 0;
   const manageFee = Number(q && q.manage_fee) || 0;
   const grand = Math.round((total + manageFee) * (1 + taxRate / 100) * 100) / 100;
-  return db.quotes.update(quoteId, {
+  return await db.quotes.update(quoteId, {
     total_amount: total,
     cost_amount: cost,
     grand_total: grand,
@@ -2752,19 +2470,20 @@ function recalc(quoteId) {
   });
 }
 
-function withItems(q) {
+async function withItems(q) {
   if (!q) return null;
-  return { ...q, items: itemsOf(q.id), status_label: STATUS_LABEL[q.status] || q.status };
+  const items = await itemsOf(q.id);
+  return { ...q, items, status_label: STATUS_LABEL[q.status] || q.status };
 }
 
 module.exports = function register(api) {
 
   /* ---------------- 列表 ---------------- */
   api.get('/quotes', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const q = req.query || {};
-    let list = db.quotes.find((x) => x.org_id === user.org_id && x.status !== 'archived');
+    let list = await db.quotes.find((x) => x.org_id === user.org_id && x.status !== 'archived');
 
     if (q.status && q.status !== 'all') list = list.filter((x) => x.status === q.status);
     if (q.keyword) {
@@ -2779,37 +2498,37 @@ module.exports = function register(api) {
     ok(res, {
       items: list,
       total: list.length,
-      stats: quoteStats(db.quotes.find((x) => x.org_id === user.org_id)),
+      stats: quoteStats(await db.quotes.find((x) => x.org_id === user.org_id)),
     });
   });
 
   api.get('/quotes/stats', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const q = req.query || {};
-    let list = db.quotes.find((x) => x.org_id === user.org_id);
+    let list = await db.quotes.find((x) => x.org_id === user.org_id);
     if (q.range && q.range !== 'all') list = filterByRange(list, q.range);
     ok(res, quoteStats(list));
   });
 
   /* ---------------- 详情 ---------------- */
   api.get('/quotes/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
-    ok(res, withItems(q));
+    ok(res, await withItems(q));
   });
 
   /* ---------------- 新建 ---------------- */
   api.post('/quotes', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const quote = db.quotes.insert({
+    const quote = await db.quotes.insert({
       id: uid(),
       org_id: user.org_id,
       user_id: user.id,
-      quote_number: genQuoteNo(user.org_id),
+      quote_number: await genQuoteNo(user.org_id),
       title: body.title || '未命名报价',
       customer_id: body.customer_id || '',
       customer_name: body.customer_name || '',
@@ -2834,14 +2553,14 @@ module.exports = function register(api) {
       export_unlocked: false,
       created_at: now(), updated_at: now(),
     });
-    ok(res, withItems(quote), 201);
+    ok(res, await withItems(quote), 201);
   });
 
   /* ---------------- 更新 ---------------- */
   api.put('/quotes/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
     if (['won', 'lost'].includes(q.status)) return fail(res, '已结案的报价不可再修改，请先撤回状态。');
 
@@ -2851,62 +2570,62 @@ module.exports = function register(api) {
     const patch = {};
     allow.forEach((k) => { if (body[k] !== undefined) patch[k] = body[k]; });
 
-    db.quotes.update(params.id, patch);
-    recalc(params.id);
+    await db.quotes.update(params.id, patch);
+    await recalc(params.id);
     logHistory(params.id, user, 'update', '更新报价信息');
-    ok(res, withItems(db.quotes.findOne({ id: params.id })));
+    ok(res, await withItems(q));
   });
 
   api.del('/quotes/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
     if (!['owner', 'admin'].includes(user.role) && q.user_id !== user.id) {
       return fail(res, '仅管理员或创建人可删除。', 403);
     }
     if (q.status === 'won') return fail(res, '已成交的报价不可删除（财务与业绩留痕要求）。如需作废，请先改为「未成交」或「已归档」。', 403);
     if (q.status === 'issued') return fail(res, '已签发的报价不可直接删除，请先置为「已归档」再删除。', 403);
-    db.quote_items.removeWhere((it) => it.quote_id === params.id);
-    db.quotes.remove(params.id);
+    await db.quote_items.removeWhere((it) => it.quote_id === params.id);
+    await db.quotes.remove(params.id);
     ok(res, { ok: true });
   });
 
   api.post('/quotes/:id/duplicate', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const src = db.quotes.findOne({ id: params.id });
+    const src = await db.quotes.findOne({ id: params.id });
     if (!src || src.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
     const { id, created_at, updated_at, quote_number, ...rest } = src;
-    const copy = db.quotes.insert({
+    const copy = await db.quotes.insert({
       ...rest,
       id: uid(),
-      quote_number: genQuoteNo(user.org_id),
+      quote_number: await genQuoteNo(user.org_id),
       title: `${src.title}（副本）`,
       status: 'draft',
       share_token: '',
       export_unlocked: false,
       created_at: now(), updated_at: now(),
     });
-    db.quote_items.insertMany(
+    await db.quote_items.insertMany(
       itemsOf(params.id).map((it) => ({ ...it, id: uid(), quote_id: copy.id, created_at: now() }))
     );
-    ok(res, withItems(copy), 201);
+    ok(res, await withItems(copy), 201);
   });
 
   /* ---------------- 明细 ---------------- */
   api.get('/quotes/:id/items', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, itemsOf(params.id));
+    ok(res, await itemsOf(params.id));
   });
 
   api.post('/quotes/:id/items', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
-    const item = db.quote_items.insert({
+    const item = await db.quote_items.insert({
       id: uid(),
       quote_id: params.id,
       org_id: user.org_id,
@@ -2922,50 +2641,50 @@ module.exports = function register(api) {
       created_at: now(),
       amount: Math.round((Number(body.unit_price) || 0) * (Number(body.qty) || 1) * 100) / 100,
     });
-    recalc(params.id);
+    await recalc(params.id);
     ok(res, { ...item, subtotal: item.amount }, 201);
   });
 
   api.put('/quotes/:id/items/:itemId', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const item = db.quote_items.findOne({ id: params.itemId });
+    const item = await db.quote_items.findOne({ id: params.itemId });
     if (!item || item.quote_id !== params.id) return fail(res, '明细不存在。', 404);
     const allow = ['group_name', 'name', 'unit', 'qty', 'unit_price', 'cost_price', 'craft', 'remark'];
     const patch = {};
     allow.forEach((k) => { if (body[k] !== undefined) patch[k] = body[k]; });
     patch.amount = Math.round((Number(patch.unit_price ?? updated.unit_price) || 0) * (Number(patch.qty ?? updated.qty) || 0) * 100) / 100;
-    const updated = db.quote_items.update(params.itemId, patch);
-    recalc(params.id);
+    const updated = await db.quote_items.update(params.itemId, patch);
+    await recalc(params.id);
     ok(res, { ...updated, subtotal: updated.amount });
   });
 
   api.del('/quotes/:id/items/:itemId', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    db.quote_items.remove(params.itemId);
-    recalc(params.id);
+    await db.quote_items.remove(params.itemId);
+    await recalc(params.id);
     ok(res, { ok: true });
   });
 
   /** 批量保存明细（编辑器整表保存） */
   api.post('/quotes/:id/items/batch', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
     const list = Array.isArray(body.items) ? body.items : [];
     const keepIds = new Set();
     for (const it of list) {
-      if (it.id && db.quote_items.findOne({ id: it.id })) {
+      if (it.id && (await db.quote_items.findOne({ id: it.id }))) {
         keepIds.add(it.id);
-        db.quote_items.update(it.id, {
+        await db.quote_items.update(it.id, {
           group_name: it.group_name, name: it.name, unit: it.unit,
           qty: Number(it.qty) || 0, unit_price: Number(it.unit_price) || 0,
           cost_price: Number(it.cost_price) || 0, craft: it.craft || '', remark: it.remark || '',
         });
       } else {
-        const n = db.quote_items.insert({
+        const n = await db.quote_items.insert({
           id: uid(), quote_id: params.id, org_id: user.org_id,
           group_name: it.group_name || '未分类', name: it.name || '新项目', unit: it.unit || '项',
           qty: Number(it.qty) || 0, unit_price: Number(it.unit_price) || 0,
@@ -2976,17 +2695,17 @@ module.exports = function register(api) {
       }
     }
     if (body.replace) {
-      db.quote_items.removeWhere((it) => it.quote_id === params.id && !keepIds.has(it.id));
+      await db.quote_items.removeWhere((it) => it.quote_id === params.id && !keepIds.has(it.id));
     }
-    recalc(params.id);
-    ok(res, itemsOf(params.id));
+    await recalc(params.id);
+    ok(res, await itemsOf(params.id));
   });
 
   /* ---------------- 状态流转 ---------------- */
   const doTransition = (to, label, extra = {}) => async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
     const allowed = TRANSITIONS[q.status] || [];
     if (!allowed.includes(to)) {
@@ -2995,9 +2714,9 @@ module.exports = function register(api) {
     if (to === 'issued' && !itemsOf(params.id).length) {
       return fail(res, '报价还没有明细，先添加项目再签发。');
     }
-    db.quotes.update(params.id, { status: to, ...extra, updated_at: now() });
+    await db.quotes.update(params.id, { status: to, ...extra, updated_at: now() });
     logHistory(params.id, user, to, label);
-    ok(res, withItems(db.quotes.findOne({ id: params.id })));
+    ok(res, await withItems(q));
   };
 
   api.post('/quotes/:id/submit', doTransition('pending_approval', '提交审批'));
@@ -3015,53 +2734,53 @@ module.exports = function register(api) {
   api.post('/quotes/:id/abandon', doTransition('abandoned', '放弃'));
 
   api.post('/quotes/:id/archive', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    db.quotes.update(params.id, { status: 'archived', updated_at: now() });
+    await db.quotes.update(params.id, { status: 'archived', updated_at: now() });
     logHistory(params.id, user, 'archive', '归档');
     ok(res, { ok: true });
   });
 
   api.post('/quotes/:id/unarchive', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    db.quotes.update(params.id, { status: 'draft', updated_at: now() });
+    await db.quotes.update(params.id, { status: 'draft', updated_at: now() });
     ok(res, { ok: true });
   });
 
   /** 变更单：记录变更并回到可编辑状态 */
   api.post('/quotes/:id/change-order', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
-    db.notifications.insert({
+    await db.notifications.insert({
       id: uid(), org_id: user.org_id, type: 'change_order', quote_id: params.id,
       reason: body.reason || '', amount_delta: Number(body.amount_delta) || 0,
       status: 'recorded', created_by: user.id, created_at: now(),
     });
-    db.quotes.update(params.id, { status: 'draft', updated_at: now() });
+    await db.quotes.update(params.id, { status: 'draft', updated_at: now() });
     logHistory(params.id, user, 'change_order', `发起变更：${body.reason || '未填写原因'}`);
-    ok(res, withItems(db.quotes.findOne({ id: params.id })));
+    ok(res, await withItems(q));
   });
 
   /* ---------------- 历史 / 审计 / 用量 ---------------- */
   api.get('/quotes/:id/history', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, db.notifications.find({ quote_id: params.id, type: 'quote_log' })
+    ok(res, await db.notifications.find({ quote_id: params.id, type: 'quote_log' })
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.get('/quotes/:id/pricing-audit', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const items = itemsOf(params.id);
+    const items = await itemsOf(params.id);
     const issues = [];
     const byGroup = {};
-    items.forEach((i) => {
+    for (const i of items) {
       byGroup[i.group_name] = (byGroup[i.group_name] || 0) + i.unit_price * i.qty;
-      const lib = db.library.findOne((x) => x.name === i.name && (x.org_id === user.org_id || !x.org_id));
+      const lib = await db.library.findOne((x) => x.name === i.name && (x.org_id === user.org_id || !x.org_id));
       if (lib && i.unit_price > lib.price * 1.4) {
         issues.push({ level: 'high', item: i.name, current: i.unit_price, reference: lib.price, msg: '单价高于工艺库基准 40% 以上' });
       } else if (lib && i.unit_price < lib.price * 0.6) {
@@ -3070,7 +2789,7 @@ module.exports = function register(api) {
       if (!i.cost_price || i.cost_price <= 0) {
         issues.push({ level: 'warn', item: i.name, msg: '未填写成本，毛利统计不准' });
       }
-    });
+    }
     const total = items.reduce((s, i) => s + i.unit_price * i.qty, 0);
     ok(res, {
       item_count: items.length,
@@ -3084,9 +2803,9 @@ module.exports = function register(api) {
   });
 
   api.get('/quotes/:id/material-takeoff', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const items = itemsOf(params.id);
+    const items = await itemsOf(params.id);
     const RULES = [
       { re: /乳胶漆|刷漆/, mat: '乳胶漆（L）', per: 0.14, unit: 'L' },
       { re: /腻子/, mat: '腻子粉（kg）', per: 1.6, unit: 'kg' },
@@ -3117,15 +2836,15 @@ module.exports = function register(api) {
 
   /* ---------------- 出单 / 导出解锁 ---------------- */
   api.post('/quotes/:id/unlock-export', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
     if (q.export_unlocked) return ok(res, { unlocked: true, message: '该报价已解锁，可反复导出。' });
 
     const plan = user.plan || 'free';
     if (plan === 'plus' || plan === 'enterprise') {
-      db.quotes.update(params.id, { export_unlocked: true });
+      await db.quotes.update(params.id, { export_unlocked: true });
       return ok(res, { unlocked: true, message: 'Plus/企业版不限次导出，已解锁。' });
     }
     const purchased = user.export_purchased || 0;
@@ -3133,27 +2852,27 @@ module.exports = function register(api) {
     if (purchased - used <= 0) {
       return fail(res, '出单次数不足，请先购买出单次数或升级 Plus 版。', 402, 'NEED_PURCHASE');
     }
-    db.users.update(user.id, { export_used: used + 1 });
-    db.quotes.update(params.id, { export_unlocked: true });
+    await db.users.update(user.id, { export_used: used + 1 });
+    await db.quotes.update(params.id, { export_unlocked: true });
     ok(res, { unlocked: true, remaining: purchased - used - 1, message: '已解锁，同一份报价可反复导出。' });
   });
 
   /* ---------------- 客户分享 ---------------- */
   api.post('/quotes/:id/share', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const q = db.quotes.findOne({ id: params.id });
+    const q = await db.quotes.findOne({ id: params.id });
     if (!q || q.org_id !== user.org_id) return fail(res, '报价不存在。', 404);
     const token = q.share_token || uid() + uid().slice(0, 6);
-    db.quotes.update(params.id, { share_token: token, share_enabled: true });
+    await db.quotes.update(params.id, { share_token: token, share_enabled: true });
     ok(res, { token, url: `/q/${token}` });
   });
 
   api.get('/quotes/share/:token', async (req, res, body, params) => {
-    const q = db.quotes.findOne({ share_token: params.token });
+    const q = await db.quotes.findOne({ share_token: params.token });
     if (!q || !q.share_enabled) return fail(res, '报价不存在或已取消分享。', 404);
-    const org = db.orgs.findOne({ id: q.org_id }) || {};
-    const items = itemsOf(q.id);
+    const org = await db.orgs.findOne({ id: q.org_id }) || {};
+    const items = await itemsOf(q.id);
     const showCost = !!(org.settings && org.settings.show_cost_to_client);
     ok(res, {
       quote: {
@@ -3212,8 +2931,8 @@ function quoteStats(list) {
   };
 }
 
-function logHistory(quoteId, user, action, label) {
-  db.notifications.insert({
+async function logHistory(quoteId, user, action, label) {
+  await db.notifications.insert({
     id: uid(), type: 'quote_log', quote_id: quoteId,
     action, label, user_id: user.id, user_name: user.name || user.phone,
     created_at: now(),
@@ -3232,10 +2951,10 @@ const { db, uid, now } = require('../lib/db');
 const A = require('../lib/auth');
 const { ok, fail } = require('../lib/http');
 const { seedLibraryForOrg, resetOrgLibrary } = require('../lib/seed');
-const { GROUPS } = require('../../seed/library');
+const { GROUPS } = require('../lib/seed/library');
 
-function orgLibrary(user) {
-  return db.library.find((it) => it.org_id === user.org_id);
+async function orgLibrary(user) {
+  return await db.library.find((it) => it.org_id === user.org_id);
 }
 
 module.exports = function register(api) {
@@ -3243,11 +2962,11 @@ module.exports = function register(api) {
   /* ================= 工艺价格库 ================= */
 
   api.get('/price-library', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const q = req.query || {};
-    let list = orgLibrary(user);
-    if (!list.length) { seedLibraryForOrg(user.org_id); list = orgLibrary(user); }
+    let list = await orgLibrary(user);
+    if (!list.length) { await seedLibraryForOrg(user.org_id); list = await orgLibrary(user); }
     if (q.keyword) {
       const kw = String(q.keyword).toLowerCase();
       list = list.filter((x) => x.name.toLowerCase().includes(kw) || (x.tags || []).some((t) => t.includes(kw)));
@@ -3262,7 +2981,7 @@ module.exports = function register(api) {
   });
 
   api.get('/price-library/presets', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, [
       { code: 'default', name: '系统标准库', desc: '内置 180 条常用工艺，覆盖八大分类' },
@@ -3273,39 +2992,39 @@ module.exports = function register(api) {
   });
 
   api.post('/price-library/apply-preset', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const factor = { default: 1, economy: 0.88, quality: 1.15, premium: 1.35 }[body.code] || 1;
-    const list = orgLibrary(user);
-    const base = db.library.find((it) => !it.org_id);
-    list.forEach((it) => {
+    const list = await orgLibrary(user);
+    const base = await db.library.find((it) => !it.org_id);
+    for (const it of list) {
       const sys = base.find((x) => x.name === it.name);
       const p = sys ? sys.price : it.price / factor;
-      db.library.update(it.id, {
+      await db.library.update(it.id, {
         price: Math.round(p * factor * 100) / 100,
         cost: Math.round((sys ? sys.cost : it.cost / factor) * factor * 100) / 100,
       });
-    });
-    db.library.flush();
+    }
+    await db.library.flush();
     ok(res, { applied: body.code, count: list.length, message: `已应用预设，共更新 ${list.length} 条工艺价格。` });
   });
 
   api.post('/price-library/reset', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const n = resetOrgLibrary(user.org_id);
+    const n = await resetOrgLibrary(user.org_id);
     ok(res, { ok: true, count: n, message: `已重置为系统标准库，共 ${n} 条。` });
   });
 
   api.post('/price-library/import', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const rows = Array.isArray(body.items) ? body.items : [];
     if (!rows.length) return fail(res, '没有可导入的数据。');
     let added = 0, updated = 0;
     for (const r of rows) {
       if (!r.name) continue;
-      const exist = db.library.findOne((x) => x.org_id === user.org_id && x.name === r.name);
+      const exist = await db.library.findOne((x) => x.org_id === user.org_id && x.name === r.name);
       const data = {
         group_key: r.group_key || 'misc',
         group_name: r.group_name || '未分类',
@@ -3316,26 +3035,26 @@ module.exports = function register(api) {
         craft: r.craft || '',
         tags: r.tags || [],
       };
-      if (exist) { db.library.update(exist.id, data); updated += 1; }
-      else { db.library.insert({ id: uid(), org_id: user.org_id, source: 'import', created_at: now(), ...data }); added += 1; }
+      if (exist) { await db.library.update(exist.id, data); updated += 1; }
+      else { await db.library.insert({ id: uid(), org_id: user.org_id, source: "import", created_at: now(), ...data }); added += 1; }
     }
-    db.library.flush();
+    await db.library.flush();
     ok(res, { added, updated, message: `导入完成：新增 ${added} 条，更新 ${updated} 条。` });
   });
 
   api.get('/price-library/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const it = db.library.findOne({ id: params.id });
+    const it = await db.library.findOne({ id: params.id });
     if (!it) return fail(res, '工艺不存在。', 404);
     ok(res, it);
   });
 
   api.post('/price-library', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!body.name) return fail(res, '请填写工艺名称。');
-    const item = db.library.insert({
+    const item = await db.library.insert({
       id: uid(), org_id: user.org_id, source: 'custom', created_at: now(),
       group_key: body.group_key || 'misc',
       group_name: body.group_name || GROUPS.find((g) => g.key === body.group_key)?.name || '未分类',
@@ -3347,36 +3066,36 @@ module.exports = function register(api) {
   });
 
   api.put('/price-library/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const it = db.library.findOne({ id: params.id });
+    const it = await db.library.findOne({ id: params.id });
     if (!it) return fail(res, '工艺不存在。', 404);
     const allow = ['name', 'unit', 'price', 'cost', 'craft', 'tags', 'group_key', 'group_name'];
     const patch = {};
     allow.forEach((k) => { if (body[k] !== undefined) patch[k] = body[k]; });
-    ok(res, db.library.update(params.id, patch));
+    ok(res, await db.library.update(params.id, patch));
   });
 
   api.del('/price-library/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    db.library.remove(params.id);
+    await db.library.remove(params.id);
     ok(res, { ok: true });
   });
 
   /* ================= 户型模板 ================= */
 
   api.get('/room-templates', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, db.templates.find((t) => t.org_id === user.org_id)
+    ok(res, await db.templates.find((t) => t.org_id === user.org_id)
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.post('/room-templates', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const tpl = db.templates.insert({
+    const tpl = await db.templates.insert({
       id: uid(), org_id: user.org_id, user_id: user.id, created_at: now(),
       name: body.name || '未命名模板',
       layout: body.layout || '',
@@ -3393,9 +3112,9 @@ module.exports = function register(api) {
   });
 
   api.put('/room-templates/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const t = db.templates.findOne({ id: params.id });
+    const t = await db.templates.findOne({ id: params.id });
     if (!t || t.org_id !== user.org_id) return fail(res, '模板不存在。', 404);
     const allow = ['name', 'layout', 'building_area', 'building_type', 'house_type', 'city', 'tier', 'spaces', 'note'];
     const patch = {};
@@ -3404,17 +3123,17 @@ module.exports = function register(api) {
   });
 
   api.del('/room-templates/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    db.templates.remove(params.id);
+    await db.templates.remove(params.id);
     ok(res, { ok: true });
   });
 
   /** 本地匹配：按面积 / 户型 / 装修类型打分（免费，不扣点数） */
   api.post('/ai/templates/match-rank', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const all = db.templates.find((t) => t.org_id === user.org_id);
+    const all = await db.templates.find((t) => t.org_id === user.org_id);
     const area = Number(body.building_area) || 0;
     const layout = String(body.layout || '');
     const houseType = String(body.house_type || '');
@@ -3466,10 +3185,10 @@ const { ok, fail } = require('../lib/http');
 
 module.exports = function register(api) {
   api.get('/customers', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const q = req.query || {};
-    let list = db.customers.find((c) => c.org_id === user.org_id);
+    let list = await db.customers.find((c) => c.org_id === user.org_id);
     if (q.keyword) {
       const kw = String(q.keyword).toLowerCase();
       list = list.filter((c) => [c.name, c.phone, c.community].some((v) => String(v || '').toLowerCase().includes(kw)));
@@ -3477,40 +3196,41 @@ module.exports = function register(api) {
     if (q.status && q.status !== 'all') list = list.filter((c) => c.status === q.status);
 
     // 附带报价统计
-    const list2 = list.map((c) => {
-      const qs = db.quotes.find((x) => x.customer_id === c.id);
-      return {
+    const listWithStats = [];
+    for (const c of list) {
+      const qs = await db.quotes.find((x) => x.customer_id === c.id);
+      listWithStats.push({
         ...c,
         quote_count: qs.length,
         won_count: qs.filter((x) => x.status === 'won').length,
         total_amount: Math.round(qs.reduce((s, x) => s + (Number(x.grand_total) || Number(x.total_amount) || 0), 0) * 100) / 100,
         last_quote_at: qs.length ? qs.map((x) => x.created_at).sort().slice(-1)[0] : null,
-      };
-    }).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+      });
+    }
 
-    ok(res, { items: list2, total: list2.length });
+    ok(res, { items: listWithStats, total: listWithStats.length });
   });
 
   api.get('/customers/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const c = db.customers.findOne({ id: params.id });
+    const c = await db.customers.findOne({ id: params.id });
     if (!c || c.org_id !== user.org_id) return fail(res, '客户不存在。', 404);
     ok(res, c);
   });
 
   api.get('/customers/:id/quotes', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    ok(res, db.quotes.find((x) => x.customer_id === params.id && x.org_id === user.org_id)
+    ok(res, await db.quotes.find((x) => x.customer_id === params.id && x.org_id === user.org_id)
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.post('/customers', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!body.name) return fail(res, '请填写客户姓名。');
-    const c = db.customers.insert({
+    const c = await db.customers.insert({
       id: uid(), org_id: user.org_id, created_at: now(),
       name: body.name,
       phone: body.phone || '',
@@ -3529,23 +3249,23 @@ module.exports = function register(api) {
   });
 
   api.put('/customers/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const c = db.customers.findOne({ id: params.id });
+    const c = await db.customers.findOne({ id: params.id });
     if (!c || c.org_id !== user.org_id) return fail(res, '客户不存在。', 404);
     const allow = ['name', 'phone', 'community', 'address', 'building_area', 'layout', 'budget',
       'source', 'status', 'level', 'remark'];
     const patch = {};
     allow.forEach((k) => { if (body[k] !== undefined) patch[k] = body[k]; });
-    ok(res, db.customers.update(params.id, patch));
+    ok(res, await db.customers.update(params.id, patch));
   });
 
   api.del('/customers/:id', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const c = db.customers.findOne({ id: params.id });
+    const c = await db.customers.findOne({ id: params.id });
     if (!c || c.org_id !== user.org_id) return fail(res, '客户不存在。', 404);
-    db.customers.remove(params.id);
+    await db.customers.remove(params.id);
     ok(res, { ok: true });
   });
 };
@@ -3605,7 +3325,7 @@ module.exports = function register(api) {
   });
 
   api.get('/ai/quota-status', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const plan = { free: 30, personal: 0, plus: 1000, enterprise: 5000 }[user.plan] || 30;
     ok(res, {
@@ -3613,7 +3333,7 @@ module.exports = function register(api) {
       credits: user.credits || 0,
       monthly_credits: plan,
       unlimited: !!user.platform_admin_unlimited,
-      usage_this_month: db.ai_logs.find((l) => l.user_id === user.id && l.month === curMonth()).length,
+      usage_this_month: (await db.ai_logs.find((l) => l.user_id === user.id && l.month === curMonth())).length,
       cost_list: AI.FEATURE_COSTS,
     });
   });
@@ -3624,7 +3344,7 @@ module.exports = function register(api) {
 
   /* ---------------- 统一调用入口（动态路由，静态路径由 Router 优先匹配） ---------------- */
   const runFeature = async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const feature = params.feature;
     if (!AI.FEATURES[feature]) return fail(res, `未知的 AI 功能：${feature}`, 404);
@@ -3642,25 +3362,25 @@ module.exports = function register(api) {
 
       const elapsed = Date.now() - started;
       // 日志记录真实消耗额（便于用量看板统计），管理员免扣余额
-      db.ai_logs.insert({
+      await db.ai_logs.insert({
         id: uid(), org_id: user.org_id, user_id: user.id,
         feature, feature_name: FEATURE_NAMES[feature] || feature,
         cost, billed: unlimited ? 0 : cost, status: 'success',
         engine: result._engine, elapsed_ms: elapsed,
         month: curMonth(), created_at: now(),
       });
-      if (!unlimited) db.users.update(user.id, { credits: (user.credits || 0) - cost });
-      db.ai_logs.flush();
+      if (!unlimited) await db.users.update(user.id, { credits: (user.credits || 0) - cost });
+      await db.ai_logs.flush();
 
       ok(res, { ...result, cost: unlimited ? 0 : cost, list_cost: cost, unlimited, elapsed_ms: elapsed });
     } catch (e) {
-      db.ai_logs.insert({
+      await db.ai_logs.insert({
         id: uid(), org_id: user.org_id, user_id: user.id,
         feature, feature_name: FEATURE_NAMES[feature] || feature,
         cost: 0, status: 'failed', error: e.message,
         month: curMonth(), created_at: now(),
       });
-      db.ai_logs.flush();
+      await db.ai_logs.flush();
       fail(res, e.message || 'AI 调用失败，请稍后重试。', 500, 'AI_FAILED');
     }
   };
@@ -3668,8 +3388,9 @@ module.exports = function register(api) {
   api.post('/ai/:feature', runFeature);
 
   /* ---------------- 兼容原站独立路径 ---------------- */
+  /* ---------------- 兼容原站独立路径 ---------------- */
   const alias = (path, feature) => {
-    api.post(path, (req, res, body) => runFeature(req, res, body, { feature }));
+    api.post(path, async (req, res, body) => await runFeature(req, res, body, { feature }));
   };
 
   alias('/ai/smart-estimate', 'smart-estimate');
@@ -3692,16 +3413,16 @@ module.exports = function register(api) {
 
   /* ---------------- 估算结果 → 正式报价 ---------------- */
   api.post('/ai/estimate-to-quote', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
 
     const payload = body.params || body;
-    const est = AI.estimate({ ...payload, pkg: AI.PACKAGES.find((p) => p.code === payload.package_code) });
+    const est = await AI.estimate({ ...payload, pkg: AI.PACKAGES.find((p) => p.code === payload.package_code) });
 
     const qid = uid();
-    const quote = db.quotes.insert({
+    const quote = await db.quotes.insert({
       id: qid, org_id: user.org_id, user_id: user.id,
-      quote_number: genQuoteNo(user.org_id),
+      quote_number: await genQuoteNo(user.org_id),
       title: `${payload.city || ''}${payload.building_area || ''}㎡ ${payload.layout || ''} ${payload.tier || ''}报价草稿`,
       city: payload.city || '', province: payload.province || '',
       building_area: Number(payload.building_area) || 0,
@@ -3720,35 +3441,39 @@ module.exports = function register(api) {
       created_at: now(), updated_at: now(),
     });
 
-    db.quote_items.insertMany(
+    await db.quote_items.insertMany(
       est.items.map((it) => ({
         ...it, id: uid(), quote_id: qid, org_id: user.org_id,
         amount: Math.round(it.unit_price * it.qty * 100) / 100,
         created_at: now(),
       }))
     );
-    db.quote_items.flush();
+    await db.quote_items.flush();
 
     ok(res, { quote, items_count: est.items.length, total: est.total, assumptions: est.assumptions });
   });
 
   /* ---------------- 用量看板（管理视角） ---------------- */
   api.get('/ai/usage-summary', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     if (!['owner', 'admin'].includes(user.role) && !user.is_platform_admin) {
       return fail(res, '仅管理员可查看用量看板。', 403);
     }
-    const logs = db.ai_logs.find((l) => l.org_id === user.org_id);
+    const logs = await db.ai_logs.find((l) => l.org_id === user.org_id);
     const byFeature = {};
     const byUser = {};
     const byDay = {};
     let tokens = 0;
+    const byUserEntries = await Promise.all(logs.map(async (l) => {
+      const u = await db.users.findOne({ id: l.user_id });
+      return { [l.user_id]: { user_id: l.user_id, name: u?.name || l.user_id, calls: 0, credits: 0 } };
+    }));
+    byUserEntries.forEach((entry) => Object.assign(byUser, entry));
     logs.forEach((l) => {
       byFeature[l.feature_name] = byFeature[l.feature_name] || { name: l.feature_name, calls: 0, credits: 0 };
       byFeature[l.feature_name].calls += 1;
       byFeature[l.feature_name].credits += l.cost || 0;
-      byUser[l.user_id] = byUser[l.user_id] || { user_id: l.user_id, name: (db.users.findOne({ id: l.user_id }) || {}).name || l.user_id, calls: 0, credits: 0 };
       byUser[l.user_id].calls += 1;
       byUser[l.user_id].credits += l.cost || 0;
       const d = (l.created_at || '').slice(0, 10);
@@ -3844,21 +3569,21 @@ module.exports = function register(api) {
   api.get('/subscriptions/plans', async (req, res) => ok(res, PLANS));
 
   api.get('/subscriptions/orders', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.kind === 'subscription')
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.post('/subscriptions/purchase', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const plan = PLANS.find((p) => p.key === body.plan);
     if (!plan) return fail(res, '套餐不存在。');
     const cycle = body.cycle === 'yearly' ? 'yearly' : 'monthly';
     const amount = cycle === 'yearly' ? (plan.yearlyTotal || plan.monthly * 12) : plan.monthly;
     if (!amount) return fail(res, '该套餐不支持在线购买，请联系我们开通。');
-    const order = db.orders.insert({
+    const order = await db.orders.insert({
       id: uid(), org_id: user.org_id, user_id: user.id, kind: 'subscription',
       order_no: genOrderNo('SUB'), plan: plan.key, plan_name: plan.name, cycle,
       amount, status: 'pending', created_at: now(),
@@ -3868,39 +3593,40 @@ module.exports = function register(api) {
 
   /* 结算：写用户套餐 + 有效期 + 赠送积分，并同步团队套餐。
    * 【坑】原实现取 PLANS[].monthly_credits_bonus —— 该字段从来不存在，
-   *       NaN || 0 得 0，于是用户走一次在线开通积分会被清零。 */
-  const settleSubscription = (order) => {
+   *       NaN || 0 得 0，于是用户走一次在线开通积分会被清零。
+   *       现在改用 PLANS[].credits（与 auth.js 的注册/月度发放同源）。 */
+  const settleSubscription = async (order) => {
     const months = order.cycle === 'yearly' ? 12 : 1;
     const expires = new Date(Date.now() + months * 30 * 86400000).toISOString();
-    const curUser = db.users.findOne({ id: order.user_id });
+    const curUser = await db.users.findOne({ id: order.user_id });
     if (!curUser) return false;
     const cur = curUser.credits || 0;
     const grant = (PLANS.find((p) => p.key === order.plan) || {}).credits || 0;
-    const okUser = db.users.update(order.user_id, {
+    const okUser = await db.users.update(order.user_id, {
       plan: order.plan,
       plan_expires_at: expires,
       credits: cur + grant,
       credits_month: new Date().toISOString().slice(0, 7),
     });
-    const org = db.orgs.findOne({ id: order.org_id });
-    const okOrg = org ? db.orgs.update(org.id, { plan: order.plan }) : true;
+    const org = await db.orgs.findOne({ id: order.org_id });
+    const okOrg = org ? await db.orgs.update(org.id, { plan: order.plan }) : true;
     return !!okUser && !!okOrg;
   };
 
   api.post('/subscriptions/orders/:id/pay', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: params.id });
+    const order = await db.orders.findOne({ id: params.id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
-    db.orders.update(order.id, { status: 'paid', paid_at: now(), pay_method: body.method || '模拟支付' });
-    settleSubscription(order);
+    await db.orders.update(order.id, { status: 'paid', paid_at: now(), pay_method: body.method || '模拟支付' });
+    await settleSubscription(order);
     ok(res, { ...db.orders.findOne({ id: order.id }), message: '支付成功，套餐已生效。' });
   });
 
   api.post('/subscriptions/orders/:id/cancel', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: params.id });
+    const order = await db.orders.findOne({ id: params.id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
     ok(res, db.orders.update(order.id, { status: 'cancelled' }));
   });
@@ -3909,24 +3635,24 @@ module.exports = function register(api) {
   api.get('/ai-credits/packs', async (req, res) => ok(res, CREDIT_PACKS));
 
   api.get('/ai-credits/balance', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, { credits: user.credits || 0, unlimited: !!user.is_platform_admin, month: user.credits_month });
   });
 
   api.get('/ai-credits/purchases', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.kind === 'credits')
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.post('/ai-credits/purchases', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const pack = CREDIT_PACKS.find((p) => p.code === body.pack_code);
     if (!pack) return fail(res, '充值包不存在。');
-    const order = db.orders.insert({
+    const order = await db.orders.insert({
       id: uid(), org_id: user.org_id, user_id: user.id, kind: 'credits',
       order_no: genOrderNo('CRD'), pack_code: pack.code, pack_name: pack.name,
       call_count: pack.credits + (pack.bonus || 0), amount: pack.price,
@@ -3936,9 +3662,9 @@ module.exports = function register(api) {
   });
 
   api.post('/ai-credits/purchases/:id/pay', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: params.id });
+    const order = await db.orders.findOne({ id: params.id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
     db.orders.update(order.id, { status: 'paid', paid_at: now(), pay_method: body.method || '模拟支付' });
     db.users.update(user.id, { credits: (user.credits || 0) + (order.call_count || 0) });
@@ -3946,7 +3672,7 @@ module.exports = function register(api) {
   });
 
   api.post('/ai-credits/purchases/:id/cancel', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.update(params.id, { status: 'cancelled' }));
   });
@@ -3955,7 +3681,7 @@ module.exports = function register(api) {
   api.get('/report-credits/packs', async (req, res) => ok(res, EXPORT_PACKS));
 
   api.get('/report-credits/balance', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, {
       purchased: user.export_purchased || 0,
@@ -3966,17 +3692,17 @@ module.exports = function register(api) {
   });
 
   api.get('/report-credits/purchases', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.kind === 'export'));
   });
 
   api.post('/report-credits/purchases', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const pack = EXPORT_PACKS.find((p) => p.code === body.pack_code);
     if (!pack) return fail(res, '次数包不存在。');
-    const order = db.orders.insert({
+    const order = await db.orders.insert({
       id: uid(), org_id: user.org_id, user_id: user.id, kind: 'export',
       order_no: genOrderNo('EXP'), pack_code: pack.code, pack_name: pack.name,
       call_count: pack.count, amount: pack.price, status: 'pending', created_at: now(),
@@ -3985,9 +3711,9 @@ module.exports = function register(api) {
   });
 
   api.post('/report-credits/purchases/:id/pay', async (req, res, body, params) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: params.id });
+    const order = await db.orders.findOne({ id: params.id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
     db.orders.update(order.id, { status: 'paid', paid_at: now(), pay_method: body.method || '模拟支付' });
     db.users.update(user.id, { export_purchased: (user.export_purchased || 0) + (order.call_count || 0) });
@@ -3996,7 +3722,7 @@ module.exports = function register(api) {
 
   /* ---------------- 发票 ---------------- */
   api.get('/invoices/records', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.invoice_requested)
       .map((o) => ({
@@ -4007,17 +3733,17 @@ module.exports = function register(api) {
   });
 
   api.get('/invoices/invoiceable-orders', async (req, res) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     ok(res, db.orders.find((o) => o.org_id === user.org_id && o.status === 'paid' && !o.invoice_requested));
   });
 
   api.post('/invoices/records', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
     const ids = Array.isArray(body.order_ids) ? body.order_ids : [];
     if (!ids.length) return fail(res, '请选择要开票的订单。');
-    ids.forEach((id) => db.orders.update(id, {
+    ids.forEach(async (id) => await db.orders.update(id, {
       invoice_requested: true, invoice_status: 'pending',
       invoice_title: body.title || '', invoice_tax_no: body.tax_no || '',
     }));
@@ -4031,9 +3757,9 @@ module.exports = function register(api) {
   }));
 
   api.post('/refunds', async (req, res, body) => {
-    const user = A.requireAuth(req, res);
+    const user = await A.requireAuth(req, res);
     if (!user) return;
-    const order = db.orders.findOne({ id: body.order_id });
+    const order = await db.orders.findOne({ id: body.order_id });
     if (!order || order.org_id !== user.org_id) return fail(res, '订单不存在。', 404);
     ok(res, db.notifications.insert({
       id: uid(), org_id: user.org_id, type: 'refund_request', order_id: order.id,
@@ -4065,14 +3791,14 @@ const { ok, fail } = require('../lib/http');
 
 module.exports = function register(api) {
   api.get('/admin/overview', async (req, res) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
 
-    const users = db.users.all();
-    const orgs = db.orgs.all();
-    const quotes = db.quotes.all();
-    const orders = db.orders.all();
-    const logs = db.ai_logs.all();
+    const users = await db.users.all();
+    const orgs = await db.orgs.all();
+    const quotes = await db.quotes.all();
+    const orders = await db.orders.all();
+    const logs = await db.ai_logs.all();
 
     const today = new Date().toISOString().slice(0, 10);
     ok(res, {
@@ -4099,41 +3825,41 @@ module.exports = function register(api) {
         failed: logs.filter((l) => l.status === 'failed').length,
         engine: require('../lib/ai').provider.enabled ? 'llm' : 'local-rule-engine',
       },
-      library: { total: db.library.all().length, system: db.library.find((x) => !x.org_id).length },
+      library: { total: (await db.library.all()).length, system: (await db.library.find((x) => !x.org_id)).length },
     });
   });
 
   api.get('/admin/users', async (req, res) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    const list = db.users.all().map((u) => {
-      const org = db.orgs.findOne({ id: u.org_id });
+    const userList = await Promise.all((await db.users.all()).map(async (u) => {
+      const org = await db.orgs.findOne({ id: u.org_id });
       return {
         ...A.publicUser(u),
         org_name: org ? org.name : '',
-        quote_count: db.quotes.count((q) => q.org_id === u.org_id),
+        quote_count: await db.quotes.count((q) => q.org_id === u.org_id),
       };
-    }).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
-    ok(res, list);
+    }));
+    ok(res, userList.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.put('/admin/users/:id/status', async (req, res, body, params) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
     if (params.id === admin.id) return fail(res, '不能停用自己。');
-    ok(res, A.publicUser(db.users.update(params.id, { status: body.status === 'disabled' ? 'disabled' : 'active' })));
+    ok(res, A.publicUser(await db.users.update(params.id, { status: body.status === 'disabled' ? 'disabled' : 'active' })));
   });
 
   api.put('/admin/users/:id/platform-admin', async (req, res, body, params) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    ok(res, A.publicUser(db.users.update(params.id, { is_platform_admin: !!body.enabled })));
+    ok(res, A.publicUser(await db.users.update(params.id, { is_platform_admin: !!body.enabled })));
   });
 
   api.get('/admin/organizations', async (req, res) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    ok(res, db.orgs.all().map((o) => ({
+    ok(res, (await db.orgs.all()).map((o) => ({
       ...o,
       user_count: db.users.count((u) => u.org_id === o.id),
       quote_count: db.quotes.count((q) => q.org_id === o.id),
@@ -4142,64 +3868,71 @@ module.exports = function register(api) {
   });
 
   api.put('/admin/organizations/:id/plan', async (req, res, body, params) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    const org = db.orgs.findOne({ id: params.id });
+    const org = await db.orgs.findOne({ id: params.id });
     if (!org) return fail(res, '组织不存在。', 404);
-    /* 团队套餐与成员账号必须一起改到位；失败即报错，不许静默（见 server/routes/admin.js 同段注释） */
-    const okOrg = db.orgs.update(org.id, { plan: body.plan });
+    /* 团队套餐与成员账号必须一起改到位。
+     * 【坑】原实现两次写库的返回值都不检查 —— 成员账号同步失败时接口照样返回
+     *       已经改好的团队记录，管理页看着「改成功了」，而账号仍是旧套餐
+     *       （线上 18956081752 就是这样卡在 free 的）。现在失败即报错。 */
+    const okOrg = await db.orgs.update(org.id, { plan: body.plan });
     if (!okOrg) return fail(res, '团队套餐更新失败，请重试。', 500);
+    const users = await db.users.find({ org_id: org.id });
     const failed = [];
-    db.users.find({ org_id: org.id }).forEach((u) => { if (!db.users.update(u.id, { plan: body.plan })) failed.push(u.name || u.phone || u.id); });
+    for (const u of users) {
+      const r = await db.users.update(u.id, { plan: body.plan });
+      if (!r) failed.push(u.name || u.phone || u.id);
+    }
     if (failed.length) {
       return fail(res, '团队套餐已更新，但 ' + failed.length + ' 个成员账号同步失败（' + failed.join('、') + '），请重试。', 500);
     }
-    ok(res, db.orgs.findOne({ id: org.id }));
+    ok(res, await db.orgs.findOne({ id: org.id }));
   });
 
   api.put('/admin/organizations/:id/status', async (req, res, body, params) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    ok(res, db.orgs.update(params.id, { status: body.status || 'active' }));
+    ok(res, await db.orgs.update(params.id, { status: body.status || 'active' }));
   });
 
   api.get('/admin/credit-grants', async (req, res) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    ok(res, db.notifications.find((n) => n.type === 'credit_grant')
+    ok(res, (await db.notifications.find((n) => n.type === "credit_grant"))
       .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))));
   });
 
   api.post('/admin/credit-grants', async (req, res, body) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    const user = db.users.findOne({ phone: body.phone }) || db.users.findOne({ id: body.user_id });
+    const user = await db.users.findOne({ phone: body.phone }) || await db.users.findOne({ id: body.user_id });
     if (!user) return fail(res, '用户不存在。', 404);
     const amount = Number(body.amount) || 0;
     if (!amount) return fail(res, '请填写发放数量。');
-    db.users.update(user.id, { credits: (user.credits || 0) + amount });
-    ok(res, db.notifications.insert({
+    await db.users.update(user.id, { credits: (user.credits || 0) + amount });
+    ok(res, await db.notifications.insert({
       id: uid(), type: 'credit_grant', user_id: user.id, phone: user.phone,
       amount, reason: body.reason || '管理员发放', granted_by: admin.id, created_at: now(),
     }), 201);
   });
 
   api.get('/admin/refund-requests', async (req, res) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    ok(res, db.notifications.find((n) => n.type === 'refund_request'));
+    ok(res, (await db.notifications.find((n) => n.type === "refund_request")));
   });
 
   api.post('/admin/refund-requests/:id/review', async (req, res, body, params) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    const req0 = db.notifications.findOne({ id: params.id });
+    const req0 = await db.notifications.findOne({ id: params.id });
     if (!req0) return fail(res, '申请不存在。', 404);
     const approved = body.approve === true;
     if (approved && req0.order_id) {
-      db.orders.update(req0.order_id, { status: 'refunded', refunded_at: now() });
+      await db.orders.update(req0.order_id, { status: 'refunded', refunded_at: now() });
     }
-    ok(res, db.notifications.update(params.id, {
+    ok(res, await db.notifications.update(params.id, {
       status: approved ? 'approved' : 'rejected',
       reviewed_by: admin.id, review_note: body.note || '', reviewed_at: now(),
     }));
@@ -4207,9 +3940,9 @@ module.exports = function register(api) {
 
   /* 平台管理员：AI 用量总览 */
   api.get('/admin/ai-usage', async (req, res) => {
-    const admin = A.requirePlatformAdmin(req, res);
+    const admin = await A.requirePlatformAdmin(req, res);
     if (!admin) return;
-    const logs = db.ai_logs.all();
+    const logs = await db.ai_logs.all();
     const byFeature = {};
     logs.forEach((l) => {
       byFeature[l.feature_name] = byFeature[l.feature_name] || { name: l.feature_name, calls: 0, credits: 0 };
@@ -4231,8 +3964,8 @@ function countBy(list, key) {
 }
 });
 
-/* ================= seed/library.js ================= */
-__define("seed/library.js", function (module, exports, require, __dirname, __filename) {
+/* ================= server/lib/seed/library.js ================= */
+__define("server/lib/seed/library.js", function (module, exports, require, __dirname, __filename) {
 /**
  * 内置家装工艺价格库种子数据
  * 价格基准：华东二线城市（合肥 / 南京 / 苏州），城市系数 1.00
@@ -4525,7 +4258,7 @@ __define("demo/entry.js", function (module, exports, require, __dirname, __filen
  * 因此前端拿到的响应结构与真实后端逐字段一致。
  * ========================================================================== */
 
-const { db, uid, now, flushAll, resetAll, readyAll, pendingAll } = require('server/lib/db.js');
+const { db, uid, now, flushAll, resetAll } = require('server/lib/db.js');
 const { Router, ok, json } = require('server/lib/http.js');
 const A = require('server/lib/auth.js');
 const { initSystemLibrary, seedLibraryForOrg, seedDemoQuotes } = require('server/lib/seed.js');
@@ -4559,20 +4292,15 @@ api.get('/health', async (req, res) => {
 
 /* ---------------- 首次访问播种（对照 server.js 的 bootstrap） ---------------- */
 let booted = false;
-let __bootPromise = null;
 
-function bootstrap() {
-  if (__bootPromise) return __bootPromise;
-  __bootPromise = (async function () {
-    try { await readyAll(); } catch (e) { console.warn("[bootstrap] readyAll failed", e && e.message); }
-
+async function bootstrap() {
   if (booted) return;
   booted = true;
-  initSystemLibrary();
+  await initSystemLibrary();
   if (!db.users.count()) {
     const orgId = uid();
     db.orgs.insert({ id: orgId, name: '演示装饰设计工作室', plan: 'plus', created_at: now() });
-    seedLibraryForOrg(orgId);
+    await seedLibraryForOrg(orgId);
     const user = db.users.insert({
       id: uid(),
       phone: '13800000000',
@@ -4589,13 +4317,10 @@ function bootstrap() {
       is_platform_admin: true,
       created_at: now(),
     });
-    const n = seedDemoQuotes(user.id, orgId);
+    const n = await seedDemoQuotes(user.id, orgId);
     console.log(`[demo] 演示账号已就绪：13800000000 / 123456（含 ${n} 张示例报价）`);
   }
   flushAll();
-    try { await pendingAll(); } catch (e) { console.warn("[bootstrap] pendingAll failed", e && e.message); }
-  })();
-  return __bootPromise;
 }
 
 /* ---------------- 请求分发 ---------------- */
@@ -4658,11 +4383,6 @@ function stats() {
     templates: db.templates.count(),
     ai_logs: db.ai_logs.count(),
   };
-}
-
-/* 页面加载即初始化数据（含写入资料库持久层），不必等首个接口请求 */
-if (typeof setTimeout === "function") {
-  setTimeout(function () { try { bootstrap(); } catch (e) { console.warn("[boot] init failed", e && e.message); } }, 0);
 }
 
 module.exports = { handle, stats, flushAll, resetAll };

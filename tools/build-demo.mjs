@@ -32,7 +32,7 @@ const MODULES = [
   'server/routes/ai.js',
   'server/routes/billing.js',
   'server/routes/admin.js',
-  'seed/library.js',
+  'server/lib/seed/library.js',
   'demo/entry.js',
 ];
 

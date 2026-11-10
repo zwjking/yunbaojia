@@ -42,14 +42,14 @@ api.get('/health', async (req, res) => {
 /* ---------------- 首次访问播种（对照 server.js 的 bootstrap） ---------------- */
 let booted = false;
 
-function bootstrap() {
+async function bootstrap() {
   if (booted) return;
   booted = true;
-  initSystemLibrary();
+  await initSystemLibrary();
   if (!db.users.count()) {
     const orgId = uid();
     db.orgs.insert({ id: orgId, name: '演示装饰设计工作室', plan: 'plus', created_at: now() });
-    seedLibraryForOrg(orgId);
+    await seedLibraryForOrg(orgId);
     const user = db.users.insert({
       id: uid(),
       phone: '13800000000',
@@ -66,7 +66,7 @@ function bootstrap() {
       is_platform_admin: true,
       created_at: now(),
     });
-    const n = seedDemoQuotes(user.id, orgId);
+    const n = await seedDemoQuotes(user.id, orgId);
     console.log(`[demo] 演示账号已就绪：13800000000 / 123456（含 ${n} 张示例报价）`);
   }
   flushAll();
@@ -74,7 +74,7 @@ function bootstrap() {
 
 /* ---------------- 请求分发 ---------------- */
 async function handle(method, apiPath, body, headers) {
-  bootstrap();
+  await bootstrap();
 
   const m0 = String(method || 'GET').toUpperCase();
   const raw = String(apiPath || '/');
